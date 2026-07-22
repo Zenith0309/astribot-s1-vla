@@ -6,23 +6,25 @@ hdf5_to_lerobot.py — 把 collect_demos.py 产出的 HDF5 episode 转成 LeRobo
 在【训练环境】（非 ROS 容器）运行：
   python convert/hdf5_to_lerobot.py \
       --src /data0/tzs/astribot/demos \
-      --repo-id local/astribot_pick_ball \
       --root ./datasets/astribot_pick_ball
 
-  # 只转成功样本（文件名 *_ok.h5），是默认行为；--include-fail 可带上失败样本
+  # 默认转换 HDF5 内的全部相机；--resize 224 224 可统一缩放
+  # 默认只转成功样本（*_ok.h5）；--include-fail 带上失败样本
 
 输入 HDF5 结构（collect_demos.py 约定）：
   /state    (T,12) float32   torso4 + arm_left7 + gripper_left1（实际值）
   /action   (T,12) float32   同布局（指令值）
-  /images/<key>  (T,) vlen uint8 JPEG
+  /images/<key>  (T,) vlen uint8 JPEG      key 形如 astribot_whole_body_camera_head_rgbd_image_raw
   attrs: prompt / target / success / fps
 
-输出：LeRobot v3 数据集（features 命名与 eval/serve_policy.py 保持一致）
+输出：LeRobot v3 数据集。相机特征命名 observation.images.<相机名>
+（如 head_rgbd / left_wrist_rgbd / right_wrist_rgbd），与真机及官方约定对齐。
 """
 
 import argparse
 import glob
 import os
+import re
 import sys
 
 import cv2
@@ -37,51 +39,66 @@ except ImportError:
 STATE_DIM = 12
 STATE_NAMES = ([f"torso_{i}" for i in range(4)]
                + [f"arm_left_{i}" for i in range(7)] + ["gripper_left"])
-CAM_FEATURE = "observation.images.third_person"     # 与评测端约定一致
+
+
+def cam_short_name(h5_key):
+    """astribot_whole_body_camera_head_rgbd_image_raw -> head_rgbd"""
+    m = re.search(r"camera_(.+?)_image", h5_key)
+    return m.group(1) if m else h5_key
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--src", required=True, help="HDF5 episode 目录")
     p.add_argument("--repo-id", default="local/astribot_pick_ball")
-    p.add_argument("--root", default="./datasets/astribot_pick_ball",
-                   help="数据集输出目录")
+    p.add_argument("--root", default="./datasets/astribot_pick_ball")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--include-fail", action="store_true")
     p.add_argument("--resize", type=int, nargs=2, default=None,
                    metavar=("H", "W"), help="可选：统一缩放图像，如 224 224")
-    p.add_argument("--camera-key", default=None,
-                   help="HDF5 images/ 组下的键名；默认取第一个")
+    p.add_argument("--cameras", nargs="+", default=None,
+                   help="只转这些相机（短名，如 head_rgbd）；默认全部")
     return p.parse_args()
 
 
-def load_episode(path, cam_key, resize):
-    with h5py.File(path, "r") as f:
-        state = np.asarray(f["state"], dtype=np.float32)
-        action = np.asarray(f["action"], dtype=np.float32)
-        keys = list(f["images"].keys())
-        if not keys:
-            raise RuntimeError(f"{path} 没有图像数据")
-        key = cam_key or keys[0]
-        frames = []
-        for raw in f["images"][key]:
-            buf = np.asarray(raw, dtype=np.uint8)
-            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)          # BGR
-            if img is None:
-                img = frames[-1].copy() if frames else None
-                if img is None:
-                    raise RuntimeError(f"{path} 首帧解码失败")
+def decode_frames(dset, resize, prev_ok=None):
+    frames = []
+    for raw in dset:
+        buf = np.asarray(raw, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR) if buf.size else None   # BGR
+        if img is None:
+            if frames:
+                img = frames[-1].copy()
+            elif prev_ok is not None:
+                img = prev_ok.copy()
             else:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                raise RuntimeError("首帧解码失败且无可回退帧")
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             if resize is not None:
                 img = cv2.resize(img, (resize[1], resize[0]),
                                  interpolation=cv2.INTER_AREA)
-            frames.append(img)
+        frames.append(img)
+    return frames
+
+
+def load_episode(path, cameras, resize):
+    with h5py.File(path, "r") as f:
+        state = np.asarray(f["state"], dtype=np.float32)
+        action = np.asarray(f["action"], dtype=np.float32)
+        images = {}
+        for key in f["images"]:
+            short = cam_short_name(key)
+            if cameras is not None and short not in cameras:
+                continue
+            images[short] = decode_frames(f["images"][key], resize)
+        if not images:
+            raise RuntimeError(f"{path} 没有匹配的相机数据")
         prompt = f.attrs.get("prompt", "pick the ball and place it into the box")
         if isinstance(prompt, bytes):
             prompt = prompt.decode()
-    T = min(len(state), len(action), len(frames))
-    return state[:T], action[:T], frames[:T], str(prompt)
+    T = min([len(state), len(action)] + [len(v) for v in images.values()])
+    return state[:T], action[:T], {k: v[:T] for k, v in images.items()}, str(prompt)
 
 
 def main():
@@ -92,29 +109,37 @@ def main():
         sys.exit(f"[err] {args.src} 下没有匹配 {pattern} 的文件")
     print(f"[info] 待转换 {len(files)} 条 episode")
 
-    # 用第一条确定图像尺寸
-    _, _, frames0, _ = load_episode(files[0], args.camera_key, args.resize)
-    H, W, _ = frames0[0].shape
-    print(f"[info] 图像尺寸 {H}x{W}")
+    # 用第一条确定相机清单与图像尺寸
+    _, _, images0, _ = load_episode(files[0], args.cameras, args.resize)
+    cam_shapes = {k: v[0].shape for k, v in images0.items()}
+    for k, shp in cam_shapes.items():
+        print(f"[info] 相机 {k}: {shp[0]}x{shp[1]}")
 
     features = {
         "observation.state": {"dtype": "float32", "shape": (STATE_DIM,),
                               "names": STATE_NAMES},
         "action": {"dtype": "float32", "shape": (STATE_DIM,),
                    "names": STATE_NAMES},
-        CAM_FEATURE: {"dtype": "video", "shape": (H, W, 3),
-                      "names": ["height", "width", "channels"]},
     }
+    for k, (H, W, _) in cam_shapes.items():
+        features[f"observation.images.{k}"] = {
+            "dtype": "video", "shape": (H, W, 3),
+            "names": ["height", "width", "channels"]}
+
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id, fps=args.fps, root=args.root,
         features=features, use_videos=True)
 
     n_frames = 0
     for i, path in enumerate(files):
-        state, action, frames, prompt = load_episode(path, args.camera_key, args.resize)
+        state, action, images, prompt = load_episode(path, args.cameras, args.resize)
+        if set(images) != set(cam_shapes):
+            print(f"[warn] {os.path.basename(path)} 相机不齐 {set(images)}，跳过")
+            continue
         for t in range(len(state)):
-            frame = {"observation.state": state[t], "action": action[t],
-                     CAM_FEATURE: frames[t]}
+            frame = {"observation.state": state[t], "action": action[t]}
+            for k in images:
+                frame[f"observation.images.{k}"] = images[k][t]
             try:                                   # 新版：task 放在 frame 里
                 dataset.add_frame({**frame, "task": prompt})
             except (KeyError, ValueError, TypeError):
@@ -126,9 +151,9 @@ def main():
         n_frames += len(state)
         print(f"[{i+1}/{len(files)}] {os.path.basename(path)}  帧数 {len(state)}")
 
-    if hasattr(dataset, "finalize"):               # 数据集 v3 需要收尾
+    if hasattr(dataset, "finalize"):               # 数据集 v3 收尾
         dataset.finalize()
-    elif hasattr(dataset, "consolidate"):          # 数据集 v2 的等价操作
+    elif hasattr(dataset, "consolidate"):          # 数据集 v2 等价操作
         dataset.consolidate()
     print(f"[done] 共 {len(files)} 条 / {n_frames} 帧 -> {args.root}")
     print("下一步: bash train/train_act.sh")

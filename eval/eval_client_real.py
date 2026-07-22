@@ -48,10 +48,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--server", required=True, help="策略服务地址 IP:PORT")
     p.add_argument("--episodes", type=int, default=5)
-    p.add_argument("--camera", default="head_rgbd",
-                   choices=["head_rgbd", "torso_rgbd", "left_wrist_rgbd",
-                            "right_wrist_rgbd"],
-                   help="观测相机（训练用什么就选什么）")
+    p.add_argument("--cameras", nargs="+",
+                   default=["head_rgbd", "left_wrist_rgbd", "right_wrist_rgbd"],
+                   help="观测相机（须与训练特征一致；仿真训练默认头+双腕三路）")
     p.add_argument("--dry-run", action="store_true",
                    help="只走观测->推理链路并打印动作，不下发指令")
     p.add_argument("--max-delta", type=float, default=0.06,
@@ -92,12 +91,16 @@ class PolicyLink:
         self._send({"type": "reset"})
         return self._recv()
 
-    def act(self, state, image_bgr):
-        ok, jpg = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not ok:
-            raise RuntimeError("JPEG 编码失败")
+    def act(self, state, images_bgr):
+        """images_bgr: {相机名: BGR ndarray}"""
+        payload = {}
+        for name, img in images_bgr.items():
+            ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if not ok:
+                raise RuntimeError(f"JPEG 编码失败: {name}")
+            payload[name] = base64.b64encode(jpg.tobytes()).decode()
         self._send({"type": "act", "state": [float(v) for v in state],
-                    "image_jpeg_b64": base64.b64encode(jpg.tobytes()).decode()})
+                    "images": payload})
         rsp = self._recv()
         if "action" not in rsp:
             raise RuntimeError(f"服务端返回异常: {rsp}")
@@ -141,17 +144,18 @@ def main():
     bot = Astribot(freq=250.0)
     names = [bot.torso_name, bot.arm_left_name, bot.effector_left_name]
 
-    # 相机
-    cam = CameraBuffer()
+    # 相机（每路一个缓冲）
+    cams = {name: CameraBuffer() for name in args.cameras}
     bot.activate_camera()
     for _ in range(20):
         info = bot.get_cameras_info()
-        if info.get(args.camera, {}).get("activate"):
+        if all(info.get(n, {}).get("activate") for n in args.cameras):
             break
         print("[cam] 等待相机激活...")
         time.sleep(1.0)
-    bot.register_image_callback(args.camera, "color", cam.cb, need_decode=True)
-    print(f"[cam] {args.camera} 已就绪")
+    for name, buf in cams.items():
+        bot.register_image_callback(name, "color", buf.cb, need_decode=True)
+    print(f"[cam] 已就绪: {args.cameras}")
 
     n_ok = 0
     results = []
@@ -174,12 +178,13 @@ def main():
             for step in range(MAX_STEPS):
                 t0 = time.time()
                 state = get_state(bot, names)
-                img = cam.latest()
-                if img is None:
-                    print("[warn] 相机帧过期，跳过本步")
+                images = {n: b.latest() for n, b in cams.items()}
+                if any(v is None for v in images.values()):
+                    stale = [n for n, v in images.items() if v is None]
+                    print(f"[warn] 相机帧过期 {stale}，跳过本步")
                     time.sleep(period)
                     continue
-                action = link.act(state, img)
+                action = link.act(state, images)
 
                 # 安全限幅：相邻两步指令变化不超过 max-delta
                 if prev_cmd is not None:

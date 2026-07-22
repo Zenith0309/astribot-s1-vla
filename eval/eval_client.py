@@ -11,6 +11,9 @@ eval_client.py — 仿真闭环评测客户端（ROS 容器内运行，先 sourc
   python3 eval/eval_client.py --episodes 20 --server 127.0.0.1:9000
   python3 eval/eval_client.py --episodes 20 --color red     # 固定目标颜色
 
+默认观测 = 头 + 双腕三路相机（与真机/官方 pi05 对齐），须与训练数据一致；
+仿真 yaml camera_names 需含 head_rgbd / left_wrist_rgbd / right_wrist_rgbd。
+
 依赖 collect/ 下的采集脚本（同仓库，自动加入 sys.path）。
 """
 
@@ -19,6 +22,7 @@ import base64
 import json
 import os
 import random
+import re
 import socket
 import struct
 import sys
@@ -42,7 +46,11 @@ def parse_args():
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--server", default="127.0.0.1:9000")
     p.add_argument("--color", default=None, choices=[None, "red", "green", "blue"])
-    p.add_argument("--camera", default="/astribot_whole_body/camera/third_person/image_raw")
+    p.add_argument("--cameras", nargs="+", default=[
+        "/astribot_whole_body/camera/head_rgbd/image_raw",
+        "/astribot_whole_body/camera/left_wrist_rgbd/image_raw",
+        "/astribot_whole_body/camera/right_wrist_rgbd/image_raw"],
+        help="观测相机 topic，短名须与训练特征一致")
     p.add_argument("--seed", type=int, default=None)
     # CollectorNode 需要的参数占位（评测不用夹取标定，但基类要求存在）
     p.add_argument("--site", default="arm_left_tool")
@@ -50,9 +58,13 @@ def parse_args():
     p.add_argument("--preclose", type=float, default=35.0)
     p.add_argument("--close", type=float, default=70.0, dest="grip_close")
     p.add_argument("--seg-time", type=float, default=2.5)
-    args = p.parse_args()
-    args.cameras = [args.camera]
-    return args
+    return p.parse_args()
+
+
+def cam_short_name(topic):
+    """/astribot_whole_body/camera/head_rgbd/image_raw -> head_rgbd"""
+    m = re.search(r"camera/(.+?)/image", topic)
+    return m.group(1) if m else topic.strip("/").replace("/", "_")
 
 
 class PolicyLink:
@@ -87,25 +99,34 @@ class PolicyLink:
         self._send({"type": "reset"})
         return self._recv()
 
-    def act(self, state, image_bgr):
-        ok, jpg = cv2.imencode(".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not ok:
-            raise RuntimeError("JPEG 编码失败")
+    def act(self, state, images_bgr):
+        """images_bgr: {短名: BGR ndarray}"""
+        payload = {}
+        for name, img in images_bgr.items():
+            ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if not ok:
+                raise RuntimeError(f"JPEG 编码失败: {name}")
+            payload[name] = base64.b64encode(jpg.tobytes()).decode()
         self._send({"type": "act", "state": [float(v) for v in state],
-                    "image_jpeg_b64": base64.b64encode(jpg.tobytes()).decode()})
+                    "images": payload})
         rsp = self._recv()
         if "action" not in rsp:
             raise RuntimeError(f"服务端返回异常: {rsp}")
         return np.asarray(rsp["action"], dtype=np.float32)
 
 
-def get_obs(node, camera):
-    """观测 = state(12) + 最新一帧图像(BGR)。布局与训练数据一致。"""
+def get_obs(node, cameras):
+    """观测 = state(12) + 各相机最新帧 {短名: BGR}。布局与训练数据一致。"""
     if node.arm_q is None or node.torso_q is None:
         return None, None
     state = list(node.torso_q[:4]) + list(node.arm_q[:7]) + [node.grip_state]
-    img = node.images.get(camera)
-    return state, img
+    images = {}
+    for topic in cameras:
+        img = node.images.get(topic)
+        if img is None:
+            return state, None                     # 任一路缺帧则等待
+        images[cam_short_name(topic)] = img
+    return state, images
 
 
 def run_episode(node, link, args, ball_name):
@@ -113,11 +134,11 @@ def run_episode(node, link, args, ball_name):
     period = 1.0 / CTRL_HZ
     for step in range(MAX_STEPS):
         t0 = time.time()
-        state, img = get_obs(node, args.camera)
-        if state is None or img is None:
+        state, images = get_obs(node, args.cameras)
+        if state is None or images is None:
             node.pump(0.05)
             continue
-        action = link.act(state, img)
+        action = link.act(state, images)
         node.send_torso(action[0:4])
         node.send_arm(action[4:11])
         node.send_grip(float(np.clip(action[11], 0.0, GRIP_MAX)))

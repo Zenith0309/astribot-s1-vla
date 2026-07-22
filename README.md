@@ -38,14 +38,23 @@ pip install -r requirements_train.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 ## 第 1 步：采集数据（ROS 容器内）
 
+观测相机用「头 + 双腕」三路（与真机及官方 pi05 对齐，不用 third_person）。
+先确认仿真 yaml `camera_names` 含 `head_rgbd / left_wrist_rgbd / right_wrist_rgbd`，
+并用 `ros2 topic hz` 确认各路 ≥ 25Hz（不足则减相机或降低分辨率）。
+
 ```bash
 # 终端1: 仿真   终端2(可选): foxglove   —— 均先 source env.sh
 cd /workspace/astribot_simulation && source env.sh
-python3 collect/collect_demos.py --episodes 150 --out /workspace/demos --only-success
+python3 collect/collect_demos.py --episodes 150 --out /workspace/demos --only-success \
+    --cameras /astribot_whole_body/camera/head_rgbd/image_raw \
+              /astribot_whole_body/camera/left_wrist_rgbd/image_raw \
+              /astribot_whole_body/camera/right_wrist_rgbd/image_raw
 ```
 
 单条约 30s，150 条约一个晚上。ACT 单任务建议 ≥ 50 条成功演示，100-150 条更稳。
 容器内 `/workspace/demos` 对应宿主机挂载目录（按你的 `docker run -v` 映射找）。
+注意：官方渲染代码对左右腕相机做过名称交换（源码注释 "ERROR::exchange left and right"），
+采集前先在 Foxglove 里确认 left/right topic 画面与实际左右手一致。
 
 ## 第 2 步：格式转换（训练环境）
 
@@ -61,7 +70,12 @@ python convert/hdf5_to_lerobot.py \
 |---|---|---|
 | `observation.state` | (12,) | torso4 + arm_left7 + gripper_left1（实际值） |
 | `action` | (12,) | 同布局指令值；夹爪 0-100 百分比，0=全开 |
-| `observation.images.third_person` | (H,W,3) | 第三人称相机 RGB，30fps |
+| `observation.images.head_rgbd` | (H,W,3) | 头部相机 RGB，30fps |
+| `observation.images.left_wrist_rgbd` | (H,W,3) | 左腕相机 RGB，30fps |
+| `observation.images.right_wrist_rgbd` | (H,W,3) | 右腕相机 RGB，30fps |
+
+相机特征名自动从 topic 提取（`camera/<名>/image` → `observation.images.<名>`），
+与真机 SDK 相机命名一致，转换/训练/仿真评测/真机评测四处零配置对齐。
 
 ## 第 3 步：训练（训练环境）
 

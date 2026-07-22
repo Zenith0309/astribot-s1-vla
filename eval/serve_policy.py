@@ -3,9 +3,11 @@
 """
 serve_policy.py — ACT 策略推理服务（训练环境运行，GPU）
 
-与 eval_client.py（ROS 容器内）配对使用，协议为 TCP + 长度前缀 JSON：
-  {"type":"reset"}                                    -> {"ok":true}
-  {"type":"act","state":[12],"image_jpeg_b64":"..."}  -> {"action":[12]}
+与 eval_client(_real).py 配对使用，协议为 TCP + 长度前缀 JSON：
+  {"type":"reset"}                                          -> {"ok":true}
+  {"type":"act","state":[12],
+   "images":{"head_rgbd":"<b64 jpeg>", ...}}                -> {"action":[12]}
+相机名须与训练数据集特征 observation.images.<名> 一致。
 
 用法:
   python eval/serve_policy.py --ckpt outputs/train/act_pick_ball/checkpoints/last/pretrained_model
@@ -26,8 +28,6 @@ try:
     from lerobot.policies.act.modeling_act import ACTPolicy
 except ImportError:
     from lerobot.common.policies.act.modeling_act import ACTPolicy
-
-CAM_FEATURE = "observation.images.third_person"     # 与转换脚本约定一致
 
 
 def recv_msg(conn):
@@ -87,12 +87,15 @@ def main():
                 elif msg["type"] == "act":
                     state = torch.tensor(msg["state"], dtype=torch.float32,
                                          device=args.device).unsqueeze(0)
-                    jpg = base64.b64decode(msg["image_jpeg_b64"])
-                    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img_t = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
-                    img_t = img_t.unsqueeze(0).to(args.device)
-                    batch = {"observation.state": state, CAM_FEATURE: img_t}
+                    batch = {"observation.state": state}
+                    for cam, b64 in msg["images"].items():
+                        jpg = base64.b64decode(b64)
+                        img = cv2.imdecode(np.frombuffer(jpg, np.uint8),
+                                           cv2.IMREAD_COLOR)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        img_t = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+                        batch[f"observation.images.{cam}"] = \
+                            img_t.unsqueeze(0).to(args.device)
                     with torch.inference_mode():
                         action = policy.select_action(batch)
                     send_msg(conn, {"action": action.squeeze(0).cpu().tolist()})
