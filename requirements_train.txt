@@ -1,0 +1,10 @@
+# 训练环境依赖（Python >= 3.10，独立于 ROS 容器）
+# 境内安装:
+#   pip install -r requirements_train.txt -i https://mirrors.aliyun.com/pypi/simple/
+#   export HF_ENDPOINT=https://hf-mirror.com   # 训练前设置（下载 ResNet backbone）
+lerobot
+torch
+torchvision
+h5py
+opencv-python
+numpy

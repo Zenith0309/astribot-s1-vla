@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.h5
+demos/
+datasets/
+outputs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+eval_results.json
+.DS_Store
