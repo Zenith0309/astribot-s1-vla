@@ -18,7 +18,8 @@ astribot-act/
 │   └── train_act.sh          # lerobot-train ACT 训练脚本
 ├── eval/
 │   ├── serve_policy.py       # 推理服务：TCP + JSON（训练环境，GPU）
-│   └── eval_client.py        # 评测客户端：30Hz 闭环（ROS2 容器内）
+│   ├── eval_client.py        # 仿真评测客户端：30Hz 闭环（ROS2 容器内）
+│   └── eval_client_real.py   # 真机评测客户端（机器人本体电脑，官方 ROS2 SDK）
 └── requirements_train.txt    # 训练环境依赖
 ```
 
@@ -85,6 +86,23 @@ python3 eval/eval_client.py --episodes 20 --server 127.0.0.1:9000
 
 容器为 `--network=host`，客户端直接连宿主机 `127.0.0.1:9000`。
 评测复用采集时的场景随机化与 TF 成功判定（球与容器水平距离 <7cm 且落底），结果写入 `eval_results.json`。
+
+## 第 5 步（可选）：真机评测
+
+真机走官方 ROS2 SDK 高层接口（`set_joints_position` filter 模式），严禁直接发 `joint_space_command`。
+
+```bash
+# GPU 机器：起推理服务（与仿真评测同一个）
+python eval/serve_policy.py --ckpt <checkpoint>/pretrained_model
+
+# 机器人本体电脑（aarch64）：
+source /path/to/astribot_sdk_aarch64/env.sh
+python3 eval_client_real.py --server <GPU机器IP>:9000 --dry-run   # 先验证链路
+python3 eval_client_real.py --server <GPU机器IP>:9000             # 正式执行
+```
+
+安全机制：相邻两步动作限幅（`--max-delta`，默认 0.06 rad）、夹爪钳位 0-85、异常/Ctrl+C 自动 `stop_robot()`。首次务必 `--dry-run`，急停在手边。
+注意：仿真训练的策略因视觉域差距大概率无法直接在真机成功，此脚本首要作用是打通部署链路。
 
 ## 常见问题
 
