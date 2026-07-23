@@ -20,6 +20,7 @@ scripted_grasp.py — Astribot S1 仿真脚本化抓取演示（无需模型权�
 import argparse
 import math
 import os
+import threading
 import time
 import numpy as np
 import mujoco
@@ -54,7 +55,8 @@ CHASSIS_JOINTS = ["astribot_chassis_x", "astribot_chassis_y", "astribot_chassis_
 CHASSIS_STATE_TOPIC = "/astribot_chassis/joint_space_states"
 WORLD_FRAME = "simulation"
 
-CTRL_HZ = 50.0            # 指令发布频率
+CTRL_HZ = 50.0            # 指令发布频率（仿真时间）
+STATE_HZ = 50.0           # 仿真每仿真秒发布的关节状态条数（实测：主循环50Hz每步一条）
 GRASP_HOVER = 0.12        # 球上方悬停高度 (m)
 GRASP_DEPTH = 0.0         # 下探目标=抓取中心对准球心 (m)
 LIFT_HEIGHT = 0.20        # 提起高度 (m)
@@ -75,6 +77,8 @@ def parse_args():
     p.add_argument("--close", type=float, default=70.0, dest="grip_close", help="夹爪闭合指令值(0-100, 70=适度夹持,100全闭会挤出球)")
     p.add_argument("--mjcf", default=MJCF_PATH, help="MJCF 路径")
     p.add_argument("--seg-time", type=float, default=2.5, help="每段运动时长(秒)")
+    p.add_argument("--hold-min", type=float, default=62.0,
+                   help="自适应闭合的保持下限(0-100)。滑落调大，挤飞调小。实测62为甜点")
     p.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("DX", "DY", "DZ"),
                    help="抓取点相对球心的补偿(m)。使用官方TCP(arm_left_tool)后默认无需补偿")
@@ -111,6 +115,21 @@ class Kinematics:
                 raise RuntimeError(f"模型中找不到躯干关节 {name}")
             self.torso_qpos.append(self.model.jnt_qposadr[jid])
             self.torso_dof.append(self.model.jnt_dofadr[jid])
+
+        # 头部关节与头部相机（视线跟踪用）：按名字模糊匹配，找不到则禁用该功能
+        head_j = []
+        for j in range(self.model.njnt):
+            nm = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+            if "head" in nm:
+                head_j.append(self.model.jnt_qposadr[j])
+        self.head_qpos = sorted(head_j)[:2]
+        self.head_cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_rgbd")
+        if self.head_cam_id < 0:
+            for c in range(self.model.ncam):
+                cn = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, c) or ""
+                if "head" in cn:
+                    self.head_cam_id = c
+                    break
 
         # 末端：优先用左右指尖中点（真实抓取中心）；退化到单 site/body
         self.ee_pair = None
@@ -241,6 +260,45 @@ class Kinematics:
         return final_err < 0.03, qt, qa
 
 
+    # ---- 头部视线跟踪（2-DoF 数值解） ----
+    def _head_gaze_err(self, hq, target):
+        """误差 = 1 - cos(相机光轴, 指向目标向量)。"""
+        for adr, v in zip(self.head_qpos, hq):
+            self.data.qpos[adr] = v
+        mujoco.mj_forward(self.model, self.data)
+        p = self.data.cam_xpos[self.head_cam_id]
+        mat = self.data.cam_xmat[self.head_cam_id].reshape(3, 3)
+        f = -mat[:, 2]                      # MuJoCo 相机朝 -Z 看
+        d = np.asarray(target, float) - p
+        n = np.linalg.norm(d)
+        if n < 1e-6:
+            return 0.0
+        return 1.0 - float(np.dot(f, d / n))
+
+    def head_look_at(self, target, head_now):
+        """求让头部相机光轴指向 target 的 [yaw, pitch]（坐标下降，热启动后很快）。"""
+        if self.head_cam_id < 0 or len(self.head_qpos) < 2:
+            return list(head_now[:2])
+        lim = np.array([[-1.57, 1.57], [-1.22, 1.22]])   # 头部关节限位
+        q = np.clip(np.asarray(head_now[:2], float), lim[:, 0], lim[:, 1])
+        step = 0.12
+        base = self._head_gaze_err(q, target)
+        for _ in range(14):        # 热启动下足够收敛；限制次数避免吃满CPU干扰控制时序
+            improved = False
+            for j in (0, 1):
+                for s in (step, -step):
+                    qt = q.copy()
+                    qt[j] = np.clip(qt[j] + s, lim[j, 0], lim[j, 1])
+                    e = self._head_gaze_err(qt, target)
+                    if e < base - 1e-7:
+                        q, base, improved = qt, e, True
+            if not improved:
+                step *= 0.5
+                if step < 0.008:
+                    break
+        return q.tolist()
+
+
 class GraspNode(Node):
     def __init__(self, args):
         super().__init__("scripted_grasp")
@@ -268,6 +326,50 @@ class GraspNode(Node):
         # 物体位姿：直接订阅 /tf 原始消息自行解析（绕开 tf2 监听器机制）
         self.obj_pose = {}        # child_frame_id -> ([x,y,z], 收到时间)
         self.create_subscription(TFMessage, "/tf", self._tf_cb, 50)
+        # 头部视线跟踪
+        self.track_object = None
+        self._head_cmd = None
+        # 仿真时钟：以关节状态消息计数（共享服务器上实时率会波动，
+        # 所有轨迹按仿真时间定步，不受墙钟影响）
+        self._tick = 0
+
+    def start_head_track(self, kin_head, hz=10.0, max_step=0.08):
+        """10Hz 后台线程：track_object 置为物体名即让头部相机跟踪它，置 None 停止。
+        kin_head 须为独立 Kinematics 实例（避免与主线程 IK 共用 MjData 竞态）。
+        惰性求解：仅当目标或躯干明显移动时才重解视线 IK，球静止时开销≈0，
+        避免与 50Hz 控制循环/录制线程抢 CPU 导致控制时序抖动。"""
+        def _loop():
+            period = 1.0 / hz
+            last_pt = last_torso = last_sol = None
+            while getattr(self, "_head_on", True):
+                t0 = time.time()
+                name = self.track_object
+                if name and self.torso_q is not None:
+                    ent = self.obj_pose.get(name)
+                    if ent is not None and time.time() - ent[1] < 1.0:
+                        try:
+                            pt = np.asarray(ent[0])
+                            torso = np.asarray(self.torso_q[:4])
+                            cur = np.asarray(self._head_cmd if self._head_cmd is not None
+                                             else (self.head_q or [0.0, 0.0]))[:2]
+                            need = (last_sol is None
+                                    or np.linalg.norm(pt - last_pt) > 0.01
+                                    or np.linalg.norm(torso - last_torso) > 0.02)
+                            if need:
+                                kin_head.sync(self.arm_q, self.torso_q, self.chassis_q)
+                                last_sol = np.asarray(kin_head.head_look_at(pt, cur))
+                                last_pt, last_torso = pt, torso
+                            cmd = np.clip(last_sol, cur - max_step, cur + max_step)
+                            if np.linalg.norm(cmd - cur) > 1e-4:   # 未到位才继续发
+                                self._head_cmd = cmd.tolist()
+                                self._pub_part(self.head_pub, self._head_cmd)
+                        except Exception as e:
+                            print(f"[head] 跟踪异常: {e}", flush=True)
+                else:
+                    last_pt = last_torso = last_sol = None
+                time.sleep(max(0.0, period - (time.time() - t0)))
+        self._head_on = True
+        threading.Thread(target=_loop, daemon=True).start()
 
     def _grip_cb(self, m):
         if m.position:
@@ -288,19 +390,16 @@ class GraspNode(Node):
         print("[grip] 空载标定中...")
         self.empty_tq = {}
         self.send_grip(0.0)
-        for _ in range(10):
-            self.pump(0.05)
+        self.sim_sleep(0.5)
         cmd = 0.0
         while cmd <= max_close:
             self.send_grip(cmd)
-            for _ in range(3):
-                self.pump(0.01)
-            time.sleep(0.04)
+            self.sim_sleep(0.05)
             self.empty_tq[round(cmd)] = self.grip_torque
             cmd += step
         self._grip_is_pct = self.grip_state > 2.0   # 满程时观测原始值确定量纲
         self.send_grip(0.0)
-        time.sleep(0.5)
+        self.sim_sleep(0.5)
         vals = list(self.empty_tq.values())
         print(f"[grip] 标定完成: 量纲={'百分比' if self._grip_is_pct else '弧度'}, "
               f"空载力矩范围 [{min(vals):.3f}, {max(vals):.3f}]")
@@ -328,6 +427,15 @@ class GraspNode(Node):
 
     def _arm_cb(self, msg):
         self.arm_q = list(msg.position)[:7]
+        self._tick += 1
+
+    def sim_sleep(self, dt):
+        """按仿真时间等待 dt 秒（以状态消息为时钟）。仿真变慢时自动拉长墙钟等待，
+        保证轨迹在仿真世界里始终是设计速度。带墙钟兜底防状态流中断时卡死。"""
+        target = self._tick + max(1, int(dt * STATE_HZ))
+        deadline = time.time() + max(1.0, dt * 30)
+        while self._tick < target and time.time() < deadline:
+            self.pump(0.002)
 
     def _torso_cb(self, msg):
         self.torso_q = list(msg.position)[:4]
@@ -392,8 +500,7 @@ class GraspNode(Node):
             self.send_torso(cur["torso"] + k * (tgt["torso"] - cur["torso"]))
             self._pub_part(self.arm_r_pub, cur["arm_r"] + k * (tgt["arm_r"] - cur["arm_r"]))
             self._pub_part(self.head_pub, cur["head"] + k * (tgt["head"] - cur["head"]))
-            self.pump(0.0)
-            time.sleep(1.0 / CTRL_HZ)
+            self.sim_sleep(1.0 / CTRL_HZ)
 
     def move_to_start(self, duration=4.0):
         """全身（躯干前倾+双臂抬起+头部归零）移动到官方初始姿态。"""
@@ -416,8 +523,7 @@ class GraspNode(Node):
             k = 10 * s**3 - 15 * s**4 + 6 * s**5
             self.send_arm(a_from + k * (a_to - a_from))
             self.send_torso(t_from + k * (t_to - t_from))
-            self.pump(0.0)
-            time.sleep(1.0 / CTRL_HZ)
+            self.sim_sleep(1.0 / CTRL_HZ)
 
     def adaptive_close(self, start=0.0, max_close=100.0, step=2.0,
                        squeeze=8.0, hold_min=60.0, force_th=0.15,
@@ -429,9 +535,7 @@ class GraspNode(Node):
         while cmd < max_close:
             cmd = min(cmd + step, max_close)
             self.send_grip(cmd)
-            for _ in range(3):
-                self.pump(0.01)
-            time.sleep(0.04)
+            self.sim_sleep(0.05)          # 仿真时间等待，确保力矩反馈与指令同步
             actual_pct = self.grip_pct()
             dtq = abs(self.grip_torque - self.empty_torque_at(cmd))
             contact_count = contact_count + 1 if dtq > force_th else 0
@@ -445,6 +549,7 @@ class GraspNode(Node):
                 reason = "力矩" if contact_count >= 3 else "位置停滞"
                 # 保持值 = max(接触点+余量, 下限60)：实测夹稳球需要约60%
                 hold = min(max(cmd + squeeze, hold_min), max_close)
+                self.last_contact_dtq = max(dtq, force_th)   # 供握力守护做参考
                 print(f"[grip] 接触({reason}) cmd={cmd:.0f}% actual={actual_pct:.0f}% "
                       f"Δtorque={dtq:.3f} -> 保持 {hold:.0f}%")
                 self.hold_grip(hold, 0.8)
@@ -457,8 +562,34 @@ class GraspNode(Node):
         steps = int(duration * CTRL_HZ)
         for _ in range(steps):
             self.send_grip(value)
-            self.pump(0.0)
-            time.sleep(1.0 / CTRL_HZ)
+            self.sim_sleep(1.0 / CTRL_HZ)
+
+    # ---- 握力守护：只救明确滑移，限幅防挤飞 ----
+    def start_grip_guard(self, hold, ref_dtq=None, max_bump=6.0, hz=10.0):
+        """仅位置信号：实际开度较基准继续收拢 >2.5%（球明确在外滑）时 +3%。
+        总加紧不超过初始保持值 +max_bump——提起后的力矩/开度正常波动不应触发
+        （力矩信号在运动中噪声大、会把好球挤飞，已弃用）。"""
+        self._guard_on = True
+        self._guard_cmd = float(hold)
+        cap = min(float(hold) + max_bump, 85.0)
+        def _loop():
+            base_pct = self.grip_pct()
+            while getattr(self, "_guard_on", False):
+                try:
+                    pct = self.grip_pct()
+                    if pct - base_pct > 2.5 and self._guard_cmd < cap:
+                        self._guard_cmd = min(self._guard_cmd + 3.0, cap)
+                        self.send_grip(self._guard_cmd)
+                        base_pct = pct
+                        print(f"[grip-guard] 位置滑移 pct={pct:.0f}% "
+                              f"-> 加紧至 {self._guard_cmd:.0f}% (上限{cap:.0f})", flush=True)
+                except Exception:
+                    pass
+                time.sleep(1.0 / hz)
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def stop_grip_guard(self):
+        self._guard_on = False
 
 
 def main():
@@ -487,6 +618,13 @@ def main():
         if not hasattr(node, "empty_tq"):
             node.calibrate_gripper()          # 空载力矩曲线标定（每进程一次，手举空中时）
 
+        # 头部相机跟踪目标球（独立 Kinematics 实例避免与 IK 竞态）
+        head_kin = Kinematics(args.mjcf, args.site)
+        node.start_head_track(head_kin)
+        node.track_object = args.ball
+        print(f"[head] 头部相机开始跟踪 {args.ball}")
+        time.sleep(1.0)                       # 等视线到位
+
         # 姿态锁定：以初始姿态下工具的朝向作为所有抓取动作的目标姿态（保证竖直下探不斜碰桌面）
         kin.sync(q_now, torso_now, getattr(kin, "chassis_now", None))
         _, m0 = kin.ee_pose()
@@ -512,31 +650,33 @@ def main():
         goto(ball + off + [0, 0, 0.05], "2/6 下探(快段)")
         goto(ball + off, "2/6 下探(慢段)", T_seg=2.5)
 
-        # --- 实测诊断：用真实关节状态算抓取中心，和球实时位置对比 ---
-        for _ in range(30):
-            node.pump(0.02)
+        # --- 实测诊断：用真实关节状态算抓取中心，和瞄准点（球心+补偿）对比 ---
+        node.sim_sleep(0.6)
         kin.sync(node.arm_q, node.torso_q, node.chassis_q)
         real_ee, _ = kin.ee_pose()
         ball_now = node.object_pos(args.ball)
-        delta = real_ee - ball_now
-        print(f"[debug] 抓取中心实际 {np.round(real_ee,3)} | 球当前 {np.round(ball_now,3)} | 偏差(x,y,z) {np.round(delta,3)}")
+        aim = ball_now + off                  # 瞄准点含补偿，修正不应把补偿抵消
+        delta = real_ee - aim
+        print(f"[debug] 抓取中心实际 {np.round(real_ee,3)} | 瞄准点 {np.round(aim,3)} | 偏差(x,y,z) {np.round(delta,3)}")
 
         # 闭环修正：稳态误差随构型变化，实测后反向补偿一步
         if np.linalg.norm(delta) > 0.008:
             print(f"[state] 2b/6 闭环修正 (补偿 {np.round(-delta,3)})")
-            goto(ball_now + off - delta, "2b/6 修正下探")
-            for _ in range(20):
-                node.pump(0.02)
+            goto(aim - delta, "2b/6 修正下探")
+            node.sim_sleep(0.4)
             kin.sync(node.arm_q, node.torso_q, node.chassis_q)
             real_ee2, _ = kin.ee_pose()
-            print(f"[debug] 修正后抓取中心 {np.round(real_ee2,3)} | 残余偏差 {np.round(real_ee2-ball_now,3)}")
+            print(f"[debug] 修正后抓取中心 {np.round(real_ee2,3)} | 残余偏差 {np.round(real_ee2-aim,3)}")
 
         print("[state] 3/6 自适应闭合夹爪")
-        node.adaptive_close(start=args.preclose, max_close=85.0)
-        goto(ball + [0, 0, LIFT_HEIGHT], "4/6 提起")
+        hold = node.adaptive_close(start=args.preclose, max_close=85.0,
+                                   hold_min=args.hold_min)
+        node.start_grip_guard(hold, getattr(node, "last_contact_dtq", 0.5))
+        goto(ball + off + [0, 0, LIFT_HEIGHT], "4/6 提起")   # 带补偿竖直提起
         goto(box + [0, 0, LIFT_HEIGHT], "5/6 移到容器上方")
         goto(box + [0, 0, 0.10], "6a/6 下放至容器口", T_seg=1.5)   # 低位释放，避免球弹出/甩飞
         print("[state] 6/6 松开夹爪")
+        node.stop_grip_guard()
         node.hold_grip(args.grip_open, 1.2)
         goto(box + [0, 0, LIFT_HEIGHT + 0.05], "收回")
         print("[done] 抓取流程结束，看 Foxglove/窗口验证球是否入箱")

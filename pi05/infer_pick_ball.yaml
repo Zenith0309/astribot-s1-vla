@@ -1,0 +1,19 @@
+# pi05 推理服务配置 — 星尘 S1 仿真抓球
+# 放到 astribot_pi05-main/astribot_pi05/configs/infer_example/ 下用 infer.sh 引用
+
+checkpoint: "outputs/pi05_pick_ball/checkpoint-30000"   # 改成你要评测的 checkpoint
+attn_implementation: "flash_attention_2"   # 没装 flash-attn 改 "eager"
+torch_dtype: "bfloat16"
+
+port: 8000
+host: "0.0.0.0"
+server_type: "async"
+
+policy_kwargs:
+  warm_up_model: true
+  seed: 42
+
+inference_kwargs:
+  rtc_delay: 3            # RTC 滚动预测保留步数
+  denoise_num_steps: 10   # Flow Matching 去噪步数
+  action_horizon: 32

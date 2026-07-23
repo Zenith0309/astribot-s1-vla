@@ -38,7 +38,7 @@ from astribot_msgs.srv import RawRequest
 from astribot_msgs.msg import RobotJointState
 
 from scripted_grasp import (Kinematics, GraspNode, START_ARM_LEFT, START_TORSO,
-                            CTRL_HZ, GRASP_HOVER, LIFT_HEIGHT, MJCF_PATH)
+                            CTRL_HZ, STATE_HZ, GRASP_HOVER, LIFT_HEIGHT, MJCF_PATH)
 
 RECORD_HZ = 30.0
 BALLS = {"red": "ball_red", "green": "ball_green", "blue": "ball_blue"}
@@ -57,7 +57,13 @@ def parse_args():
     p.add_argument("--preclose", type=float, default=35.0)
     p.add_argument("--close", type=float, default=70.0, dest="grip_close")
     p.add_argument("--seg-time", type=float, default=2.5)
+    p.add_argument("--hold-min", type=float, default=62.0,
+                   help="自适应闭合保持下限。滑落调大，挤飞调小。实测62为甜点")
     p.add_argument("--only-success", action="store_true", help="失败的 episode 不落盘")
+    p.add_argument("--no-head-track", action="store_true", help="关闭头部视线跟踪（消融/排障用）")
+    p.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                   metavar=("DX", "DY", "DZ"),
+                   help="抓取点相对球心补偿(m)，y 分量用于避开腕部蹭球，如 0 0.01 0")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
@@ -81,6 +87,7 @@ class CollectorNode(GraspNode):
         self._rec_on = False
         self._rec_buf = None
         self._rec_thread = None
+        # 头部视线跟踪逻辑继承自 GraspNode.start_head_track
 
     # ---- 覆写发布函数，顺带记录 action ----
     def send_arm(self, q):
@@ -138,9 +145,16 @@ class CollectorNode(GraspNode):
         return list(self.args.cameras)
 
     def _rec_loop(self, kin):
-        period = 1.0 / RECORD_HZ
+        # 按仿真时钟采样：每 STATE_HZ/RECORD_HZ 个状态消息采一帧，
+        # 保证训练数据帧间隔恒为 1/30 仿真秒，与实时率无关
+        tick_per_frame = STATE_HZ / RECORD_HZ
+        next_tick = float(self._tick)
         while self._rec_on:
-            t0 = time.time()
+            next_tick += tick_per_frame
+            while self._rec_on and self._tick < next_tick:
+                time.sleep(0.002)
+            if not self._rec_on:
+                break
             if self.arm_q is not None and self.torso_q is not None:
                 state = list(self.torso_q[:4]) + list(self.arm_q[:7]) + [self.grip_state]
                 action = list(self.last_cmd["torso"]) + list(self.last_cmd["arm"]) + [self.last_cmd["grip"]]
@@ -157,8 +171,6 @@ class CollectorNode(GraspNode):
                         self._rec_buf["images"][topic].append(jpg.tobytes() if ok else b"")
                     else:
                         self._rec_buf["images"][topic].append(b"")
-            dt = time.time() - t0
-            time.sleep(max(0.0, period - dt))
 
     def stop_record(self):
         self._rec_on = False
@@ -190,13 +202,13 @@ def random_scene(node, max_retry=3):
                     poses[name] = [x, y, 0.80, 0, 0, 0, 1]     # 贴桌生成，不空投
                     break
         node.set_object_poses(poses)
-        time.sleep(1.0)
+        node.sim_sleep(1.0)               # 物理沉降按仿真时间等
         # 验证：三球 TF 可查、位置与目标接近且两次采样静止
         ok = True
         for name, p in poses.items():
             try:
                 p1 = node.object_pos(name, timeout=3.0)
-                time.sleep(0.3)
+                node.sim_sleep(0.3)
                 p2 = node.object_pos(name, timeout=2.0)
             except RuntimeError:
                 ok = False; break
@@ -231,26 +243,30 @@ def run_grasp(node, kin, args, ball_name):
         node.move_smooth(q_now, q_t, torso_now, t_t, T or args.seg_time)
         q_now, torso_now = list(q_t), list(t_t)
 
+    off = np.asarray(getattr(args, "offset", [0.0, 0.0, 0.0]))
     print("[step] 抓取序列开始", flush=True)
     node.hold_grip(args.grip_open, 0.8)
-    goto(ball + np.array([0, 0, GRASP_HOVER]))
+    goto(ball + off + np.array([0, 0, GRASP_HOVER]))
     print("[step] 下探", flush=True)
     node.hold_grip(args.preclose, 0.6)          # 预收窄，避免下探蹭跑球
-    goto(ball + np.array([0, 0, 0.05]))
-    goto(ball, T=2.5)                           # 慢速下探
-    # 闭环修正：实测抓取中心与球心偏差并反向补偿（稳态误差随构型变化）
-    for _ in range(20):
-        node.pump(0.02)
+    goto(ball + off + np.array([0, 0, 0.05]))
+    goto(ball + off, T=2.5)                     # 慢速下探（瞄准点=球心+补偿）
+    # 闭环修正：实测抓取中心与瞄准点偏差并反向补偿（不抵消补偿量）
+    node.sim_sleep(0.4)                   # 等稳态（仿真时间）
     kin.sync(node.arm_q, node.torso_q, node.chassis_q)
     real_ee, _ = kin.ee_pose()
-    delta = real_ee - node.object_pos(ball_name)
+    aim = np.asarray(node.object_pos(ball_name)) + off
+    delta = real_ee - aim
     if np.linalg.norm(delta) > 0.008:
-        goto(np.asarray(node.object_pos(ball_name)) - delta, T=1.2)
-    node.adaptive_close(start=args.preclose, max_close=85.0)
+        goto(aim - delta, T=1.2)
+    hold = node.adaptive_close(start=args.preclose, max_close=85.0,
+                               hold_min=getattr(args, "hold_min", 62.0))
+    node.start_grip_guard(hold, getattr(node, "last_contact_dtq", 0.5))  # 搬运防松脱
     print("[step] 提起并移到容器", flush=True)
-    goto(ball + np.array([0, 0, LIFT_HEIGHT]))
+    goto(ball + off + np.array([0, 0, LIFT_HEIGHT]))
     goto(box + np.array([0, 0, LIFT_HEIGHT]))
     goto(box + np.array([0, 0, 0.10]), T=1.5)   # 低位释放，避免球弹出/甩飞
+    node.stop_grip_guard()
     node.hold_grip(args.grip_open, 1.2)
     goto(box + np.array([0, 0, LIFT_HEIGHT + 0.05]), T=1.5)
 
@@ -282,6 +298,9 @@ def main():
     rec_kin = Kinematics(MJCF_PATH, args.site)   # 录制线程专用，避免与主线程IK共用MjData产生竞态
     rclpy.init()
     node = CollectorNode(args)
+    if not args.no_head_track:
+        head_kin = Kinematics(MJCF_PATH, args.site)  # 头部跟踪线程专用，隔离 MjData
+        node.start_head_track(head_kin)
     # 后台独立执行器：持续处理 TF/状态/图像回调，主线程只做运动逻辑（修复长跑后 TF 监听失灵）
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
@@ -293,14 +312,19 @@ def main():
         for ep in range(args.episodes):
             print(f"\n===== Episode {ep+1}/{args.episodes} =====")
             print("[step] 回初始姿态并重摆场景", flush=True)
+            node.track_object = None          # 回位期间停止头部跟踪
+            node._head_cmd = None
             node.move_to_start(3.0)           # 初始姿态即"零位"，不再回真零位（姿态怪异）
             node.send_grip(0.0)               # 开爪备用
-            random_scene(node); time.sleep(1.0)
+            random_scene(node); node.sim_sleep(1.0)
 
             color = random.choice(list(BALLS))
             ball_name = BALLS[color]
             prompt = PROMPT_TPL.format(color=color)
             print(f"[task] {prompt}")
+            if not args.no_head_track:
+                node.track_object = ball_name  # 头部相机开始跟踪目标球
+                node.sim_sleep(1.0)            # 等视线到位再开录
             if not hasattr(node, "empty_tq"):
                 node.calibrate_gripper()      # 空载力矩曲线标定（每进程一次，手举空中时）
             if node.chassis_q is not None:
@@ -316,7 +340,8 @@ def main():
                 error = str(e)
                 print(f"[warn] 执行异常: {e}")
             buf = node.stop_record()
-            time.sleep(0.5)
+            node.stop_grip_guard()            # 兜底：异常中断时确保守护线程停止
+            node.sim_sleep(0.5)
 
             success = (error == "") and check_success(node, ball_name)
             n_all += 1; n_ok += int(success)

@@ -35,6 +35,7 @@ import rclpy
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "collect"))
 from collect_demos import CollectorNode, random_scene, check_success, BALLS, PROMPT_TPL  # noqa: E402
+from scripted_grasp import Kinematics, MJCF_PATH  # noqa: E402
 
 CTRL_HZ = 30.0            # 与训练数据录制频率一致
 MAX_STEPS = 1200          # 单条上限 40s
@@ -133,7 +134,6 @@ def run_episode(node, link, args, ball_name):
     link.reset()
     period = 1.0 / CTRL_HZ
     for step in range(MAX_STEPS):
-        t0 = time.time()
         state, images = get_obs(node, args.cameras)
         if state is None or images is None:
             node.pump(0.05)
@@ -145,8 +145,7 @@ def run_episode(node, link, args, ball_name):
         # 每秒查一次是否已成功（提前结束）
         if step % int(CTRL_HZ) == 0 and step > 0 and check_success(node, ball_name):
             return True, step
-        node.pump(0.0)
-        time.sleep(max(0.0, period - (time.time() - t0)))
+        node.sim_sleep(period)     # 按仿真时钟定步，与训练数据帧间隔一致
     return check_success(node, ball_name), MAX_STEPS
 
 
@@ -160,6 +159,8 @@ def main():
 
     rclpy.init()
     node = CollectorNode(args)
+    head_kin = Kinematics(MJCF_PATH, args.site)
+    node.start_head_track(head_kin)      # 头部跟踪与采集时一致，保证观测分布相同
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()
@@ -171,6 +172,8 @@ def main():
         node.wait_ready()
         for ep in range(args.episodes):
             print(f"\n===== Eval {ep+1}/{args.episodes} =====")
+            node.track_object = None
+            node._head_cmd = None
             node.move_to_start(3.0)
             node.send_grip(0.0)
             random_scene(node)
@@ -178,6 +181,8 @@ def main():
             color = args.color or random.choice(list(BALLS))
             ball_name = BALLS[color]
             print(f"[task] {PROMPT_TPL.format(color=color)}")
+            node.track_object = ball_name    # 与采集一致：头部相机跟踪目标球
+            time.sleep(1.0)
 
             t0 = time.time()
             success, steps = run_episode(node, link, args, ball_name)

@@ -1,0 +1,52 @@
+# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」
+# 放到 astribot_pi05-main/astribot_pi05/configs/train_example/ 下再用 train.sh 引用
+# 权重需先解压: unzip /data0/tzs/astribot/cheakpoint/pi05_base_bfloat16.zip -d /data0/tzs/astribot/cheakpoint/
+
+### 模型
+model_name_or_path: "/data0/tzs/astribot/cheakpoint/pi05_base_bfloat16"  # 解压后的权重目录
+attn_implementation: "flash_attention_2"   # 没装 flash-attn 就改 "eager"
+torch_dtype: "bfloat16"
+
+model_kwargs:
+  chunk_size: 32
+  freeze_vision_encoder: false
+  train_expert_only: false          # 数据少(150条)想更稳可先设 true 只训 expert
+  GPU_memory_opt_level: 1           # 单卡显存紧张设 2（开 gradient checkpointing）
+
+### Processor / 归一化
+processor_kwargs:
+  normalization_mode:
+    state: "quantile"
+    actions: "quantile"
+  normalization_base_path: "outputs/pi05_pick_ball/norm"   # compute_norm_stats 会写到这里
+  default_prompts:
+    astribot: "pick the ball and place it into the box"
+
+### 数据集（hdf5_to_pi05.py 转出的目录）
+robot_datasets:
+  - repo_id_list:
+      - ["pi05_pick_ball", 0.9]     # 90% 训练 / 10% 验证
+    dataset_root: "/data0/tzs/astribot/datasets"   # 上级目录；实际集在 <root>/pi05_pick_ball
+
+### 训练
+# 单卡可删掉 deepspeed 行；多卡训练用 train.sh -n <卡数>
+deepspeed: "configs/deepspeed/zero2.json"
+max_steps: 30000                    # 150 条小数据集，3w 步足够；先跑看验证曲线
+per_device_train_batch_size: 16     # 80G 卡可 32-40；显存不足往下调
+gradient_accumulation_steps: 2
+dataloader_num_workers: 8
+
+learning_rate: !!float "3e-5"       # 微调用比从头训小的 lr
+lr_scheduler_type: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr: !!float "3e-6"
+warmup_steps: 500
+
+output_dir: "outputs/pi05_pick_ball"
+overwrite_output_dir: false
+save_steps: 5000
+save_total_limit: 3
+save_safetensors: true
+
+logging_steps: 25
+seed: 42
