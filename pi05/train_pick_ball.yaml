@@ -9,9 +9,11 @@ torch_dtype: "bfloat16"
 
 model_kwargs:
   chunk_size: 32
-  freeze_vision_encoder: false
-  train_expert_only: false          # 数据少(150条)想更稳可先设 true 只训 expert
-  GPU_memory_opt_level: 1           # 单卡显存紧张设 2（开 gradient checkpointing）
+  # ===== 多卡 4090 档（ZeRO-2 分片显存）=====
+  freeze_vision_encoder: true       # 冻结视觉编码器（150条小数据，冻结防过拟合）
+  train_expert_only: true           # 只训动作 expert，冻结主干（小数据+稳，也省显存）
+  GPU_memory_opt_level: 1           # 多卡分片后无需最狠的检查点；OOM 再改 2
+  # 若卡多且想更充分微调：train_expert_only=false（ZeRO-2 分片下 4090 可尝试）
 
 ### Processor / 归一化
 processor_kwargs:
@@ -29,11 +31,11 @@ robot_datasets:
     dataset_root: "/data0/tzs/astribot/datasets"   # 上级目录；实际集在 <root>/pi05_pick_ball
 
 ### 训练
-# 单卡可删掉 deepspeed 行；多卡训练用 train.sh -n <卡数>
+# 多卡 4090：用 ZeRO-2 分片优化器/梯度；启动加 -n <卡数>
 deepspeed: "configs/deepspeed/zero2.json"
-max_steps: 30000                    # 150 条小数据集，3w 步足够；先跑看验证曲线
-per_device_train_batch_size: 16     # 80G 卡可 32-40；显存不足往下调
-gradient_accumulation_steps: 2
+max_steps: 30000                    # 150 条小数据集，3w 步足够；先看验证曲线
+per_device_train_batch_size: 2      # 每张 4090；OOM 降到 1
+gradient_accumulation_steps: 4      # 有效 batch = 2 × 卡数 × 4（如 4 卡 = 32）
 dataloader_num_workers: 8
 
 learning_rate: !!float "3e-5"       # 微调用比从头训小的 lr
