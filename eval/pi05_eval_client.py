@@ -128,9 +128,9 @@ class StateFK:
             sid = self.mj.mj_name2id(self.model, self.mj.mjtObj.mjOBJ_SITE, n)
             if sid >= 0:
                 return "site", sid
-        for i in (4, 3, 2, 1):
-            bid = self.mj.mj_name2id(self.model, self.mj.mjtObj.mjOBJ_BODY,
-                                     f"astribot_torso_link{i}")
+        for n in ("astribot_torso_link_4", "astribot_torso_link_3",
+                  "astribot_torso_link_2", "astribot_torso_link_1"):
+            bid = self.mj.mj_name2id(self.model, self.mj.mjtObj.mjOBJ_BODY, n)
             if bid >= 0:
                 return "body", bid
         raise RuntimeError("找不到躯干参考系")
@@ -195,8 +195,14 @@ def build_obs(node, fk, prompt):
             return None
         short = cam_short(topic)
         rgb = cv2.cvtColor(cv2.resize(img, (224, 224)), cv2.COLOR_BGR2RGB)
-        imgs[CAM_KEYS[short]] = rgb.astype(np.uint8)
-    state = fk.state31(node.torso_q[:4], node.arm_q[:7], node.grip_state)
+        # processor 期望 CHW float[0,1]（与训练时 LeRobot 输出一致，不是 HWC uint8）
+        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1)).astype(np.float32) / 255.0
+        imgs[CAM_KEYS[short]] = chw
+    state31 = fk.state31(node.torso_q[:4], node.arm_q[:7], node.grip_state)
+    # 官方 output_config 的 state 规范是 34 维：末尾追加 chassis [x,y,yaw]。
+    # select_pad 只读 0:31（模型输入不变），post_process 的 output_extract 需要满 34 维。
+    chassis = node.chassis_q if node.chassis_q is not None else [0.0, 0.0, 0.0]
+    state = np.concatenate([state31, np.asarray(chassis[:3], dtype=np.float32)]).astype(np.float32)
     obs = {STATE_KEY: state, "prompt": prompt}
     obs.update(imgs)
     return obs

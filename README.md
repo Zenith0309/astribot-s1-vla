@@ -1,133 +1,98 @@
-# astribot-act
+# astribot-s1-vla
 
-Astribot S1 仿真「抓球入箱」任务的 ACT 小型策略验证管线：**数据采集 → LeRobot 格式转换 → ACT 训练 → 仿真闭环评测**。
+Astribot S1 人形机器人的 **Vision-Language-Action (VLA) 数据与训练全流程工具集**：从 MuJoCo 仿真采集专家演示、到真机数据处理、双路格式转换（ACT / pi0.5）、模型训练、闭环评测，一站式打通。
 
-目的：在 pi05 预训练权重到位前，用从零训练的 ACT 先打通「数据 → 训练 → 评测」全闭环，验证数据质量与评测基建。后续换 pi05 只需替换推理服务中的模型。
+> 目标：为 Astribot S1 提供一套可复现的 VLA 数据生产 + 模型微调 + 评测管线，覆盖**仿真验证**与**真机部署**两条路径。
+
+## 这个项目解决什么
+
+VLA 模型（pi0/pi0.5 等）无法对未见过的本体零样本工作，正确路径是**当预训练底座微调**。微调需要三样东西：高质量演示数据、正确的数据格式、可靠的训练评测管线。本项目把这三样全部做齐并实测跑通：
+
+- **数据生产**：仿真侧脚本专家批量采集（无需人工遥操作即可产出演示），真机侧遥操作数据的审查与转换。
+- **格式对齐**：把采集数据转成官方 pi0.5 要求的 34 维笛卡尔 SO3 LeRobot 格式，趟平官方 fork 的一批隐藏坑。
+- **训练评测**：多卡 DeepSpeed 微调 + 仿真/真机闭环评测客户端。
 
 ## 目录结构
 
 ```
-astribot-act/
-├── collect/                  # 数据采集（ROS2 容器内运行）
-│   ├── scripted_grasp.py     #   脚本化专家：IK + 力矩自适应夹取
-│   ├── collect_demos.py      #   批量采集 -> HDF5
-│   └── go_start_pose.py      #   回官方 VLA 初始姿态
-├── convert/
-│   └── hdf5_to_lerobot.py    # HDF5 -> LeRobot v3 数据集（训练环境运行）
+astribot-s1-vla/
+├── collect/                       # 仿真数据采集（ROS2 容器内）
+│   ├── scripted_grasp.py          #   脚本专家：11-DOF IK + 力矩自适应夹取 + 底盘站位
+│   ├── collect_demos.py           #   批量采集 -> HDF5（三相机 + 头部视线跟踪）
+│   ├── go_start_pose.py           #   回官方 VLA 初始姿态（最小控制示例）
+│   └── scene_*.xml                #   自定义场景（三色球 + 容器 + 第三人称相机）
+├── convert/                       # 数据格式转换
+│   ├── hdf5_to_pi05.py            #   自采 HDF5 -> pi0.5 LeRobot（34维 SO3，FK 生成位姿）
+│   ├── hdf5_to_lerobot.py         #   自采 HDF5 -> ACT LeRobot（关节空间，快速基线）
+│   ├── official_hdf5_to_mcap.py   #   官方真机 HDF5 -> MCAP（Foxglove 审查用）
+│   └── hdf5_to_mcap.py            #   自采 HDF5 -> MCAP
 ├── train/
-│   └── train_act.sh          # lerobot-train ACT 训练脚本
+│   └── train_act.sh               # ACT 训练（LeRobot 自带实现，快速基线）
 ├── eval/
-│   ├── serve_policy.py       # 推理服务：TCP + JSON（训练环境，GPU）
-│   ├── eval_client.py        # 仿真评测客户端：30Hz 闭环（ROS2 容器内）
-│   └── eval_client_real.py   # 真机评测客户端（机器人本体电脑，官方 ROS2 SDK）
-└── requirements_train.txt    # 训练环境依赖
+│   ├── serve_policy.py            #   ACT 推理服务（TCP + JSON）
+│   ├── eval_client.py             #   ACT 仿真评测客户端
+│   ├── pi05_eval_client.py        #   pi0.5 仿真评测客户端（msgpack/WebSocket + SO3->IK）
+│   └── eval_client_real.py        #   真机评测客户端（官方 SDK 高层接口）
+├── pi05/
+│   ├── train_pick_ball.yaml       # pi0.5 训练配置（多卡 4090 档）
+│   ├── infer_pick_ball.yaml       # pi0.5 推理服务配置
+│   └── README_pi05.md             # pi0.5 微调 Runbook
+├── docs/
+│   └── pi05微调完整指南.md         # ⭐ 完整微调指南（数据采集/标注/转换/训练/评测/踩坑）
+└── requirements_train.txt
 ```
 
-架构上训练/推理环境（新版 PyTorch）与控制环境（ROS2 容器）分离，二者通过 TCP 通信——与官方 pi05 的 WebSocket 推理服务架构同构。
+## 两条路径
 
-## 前置条件
+### 路径一：仿真验证（快速迭代，零真机成本）
 
-- 仿真环境：Docker 容器 `astribot_sim`（ROS2 Humble + MuJoCo），`with_camera` 配置、`rgb_array` 模式，场景含三色球 + 容器 + `third_person` 相机（搭建见项目文档《星尘VLA仿真抓取与数据采集链路.md》）
-- 训练环境：宿主机单独 conda/venv（Python ≥ 3.10），单卡 ≥ 12G 显存
-
-```bash
-# 训练环境（宿主机）
-conda create -n act python=3.10 -y && conda activate act
-pip install -r requirements_train.txt -i https://mirrors.aliyun.com/pypi/simple/
-```
-
-## 第 1 步：采集数据（ROS 容器内）
-
-观测相机用「头 + 双腕」三路（与真机及官方 pi05 对齐，不用 third_person）。
-先确认仿真 yaml `camera_names` 含 `head_rgbd / left_wrist_rgbd / right_wrist_rgbd`，
-并用 `ros2 topic hz` 确认各路 ≥ 25Hz（不足则减相机或降低分辨率）。
+用脚本专家在 MuJoCo 里批量采集演示，验证整条"数据→训练→评测"管线。适合快速试错、验证工具链、对比不同模型/checkpoint。
 
 ```bash
-# 终端1: 仿真   终端2(可选): foxglove   —— 均先 source env.sh
-cd /workspace/astribot_simulation && source env.sh
-python3 collect/collect_demos.py --episodes 150 --out /workspace/demos --only-success \
+# 1. 采集（ROS2 容器内，仿真运行中）
+python3 collect/collect_demos.py --episodes 150 --out demos --only-success \
     --cameras /astribot_whole_body/camera/head_rgbd/image_raw \
               /astribot_whole_body/camera/left_wrist_rgbd/image_raw \
               /astribot_whole_body/camera/right_wrist_rgbd/image_raw
+
+# 2. 转 pi0.5 格式（训练环境）
+export ASTRIBOT_SIMU_ROOT=<astribot_simulation 根>
+python convert/hdf5_to_pi05.py --src demos --root datasets/pick_ball
+
+# 3. 归一化 + 训练 + 评测：见 docs/pi05微调完整指南.md
 ```
 
-单条约 30s，150 条约一个晚上。ACT 单任务建议 ≥ 50 条成功演示，100-150 条更稳。
-容器内 `/workspace/demos` 对应宿主机挂载目录（按你的 `docker run -v` 映射找）。
-注意：官方渲染代码对左右腕相机做过名称交换（源码注释 "ERROR::exchange left and right"），
-采集前先在 Foxglove 里确认 left/right topic 画面与实际左右手一致。
+> 注意：纯仿真数据训的策略因视觉域差距无法直接上真机——仿真路径的价值是**验证管线与方法**，真机部署需真机数据。
 
-## 第 2 步：格式转换（训练环境）
+### 路径二：真机数据微调（可部署策略）
 
-```bash
-python convert/hdf5_to_lerobot.py \
-    --src /data0/tzs/astribot/demos \
-    --root ./datasets/astribot_pick_ball
-```
+用官方链路遥操作采集真机数据，微调 pi0.5 得到能直接上真机的策略。数据采集、标注、转换、训练的完整步骤见 **[docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)**。真机数据原生带底盘/力矩/三相机，无 sim2real 鸿沟。
 
-默认只转成功样本（`*_ok.h5`）。特征布局（与评测端严格一致，勿单独改动）：
+## 核心文档
 
-| 特征 | 形状 | 含义 |
-|---|---|---|
-| `observation.state` | (12,) | torso4 + arm_left7 + gripper_left1（实际值） |
-| `action` | (12,) | 同布局指令值；夹爪 0-100 百分比，0=全开 |
-| `observation.images.head_rgbd` | (H,W,3) | 头部相机 RGB，30fps |
-| `observation.images.left_wrist_rgbd` | (H,W,3) | 左腕相机 RGB，30fps |
-| `observation.images.right_wrist_rgbd` | (H,W,3) | 右腕相机 RGB，30fps |
+**[docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)** 是本项目的核心 —— 从数据采集到部署评测的完整 pi0.5 微调指南，包含：
 
-相机特征名自动从 topic 提取（`camera/<名>/image` → `observation.images.<名>`），
-与真机 SDK 相机命名一致，转换/训练/仿真评测/真机评测四处零配置对齐。
+- 环境搭建（境内 tokenizer 离线化、ffmpeg）
+- 数据采集原则（随机化防因果混淆）与官方 HDF5 格式
+- 数据标注（单任务 `--coarse-prompt` / 多任务 JSON 标注 / 成功标签）
+- 转换、归一化、多卡训练、推理服务、闭环评测
+- **官方框架一批隐藏坑的解法**（add_frame 签名、sub_task_index、consolidate、离线 tokenizer、归一化路径、图像 CHW、state 34 维、sync 服务、因果混淆）
+- 34 维 SO3 动作空间布局附录
 
-## 第 3 步：训练（训练环境）
+## 技术要点
 
-```bash
-export HF_ENDPOINT=https://hf-mirror.com     # 境内下载 ResNet backbone
-bash train/train_act.sh                       # 默认 5w 步，batch 8，约需 10G 显存
-```
+- **动作空间**：官方 34 维全身笛卡尔 SO3 = `torso9 + left_arm9 + left_gripper1 + right_arm9 + right_gripper1 + head2 + chassis3`，底盘天然可学。
+- **脚本专家**：11-DOF（躯干4+手臂7）阻尼最小二乘 IK + 官方 TCP 参考系 + 力矩自适应夹取 + 仿真时钟定步（抗共享服务器实时率波动）+ 底盘按物体位置站位。
+- **观测格式**：三相机 CHW float[0,1] + 34 维 state + prompt，msgpack/WebSocket 与官方 pi0.5 推理服务同构。
+- **训练**：多卡 DeepSpeed ZeRO-2，小数据集冻结主干只训动作 expert 防过拟合。
 
-checkpoint 输出至 `outputs/train/act_pick_ball/checkpoints/<step>/pretrained_model/`。
+## 环境
 
-## 第 4 步：闭环评测（两个终端）
+- 采集侧：Docker + ROS2 Humble + MuJoCo（仿真环境搭建见配套的 astribot-mujoco-tutorial）
+- 训练侧：Python 3.11 + CUDA 12.1+ + `astribot_pi05` 框架，`pip install -r requirements_train.txt`
 
-```bash
-# 终端 A（训练环境，宿主机）：起推理服务
-python eval/serve_policy.py \
-    --ckpt outputs/train/act_pick_ball/checkpoints/last/pretrained_model
+## 参考
 
-# 终端 B（ROS 容器内，仿真运行中）：起评测客户端
-cd <本仓库> && source /workspace/astribot_simulation/env.sh
-python3 eval/eval_client.py --episodes 20 --server 127.0.0.1:9000
-```
-
-容器为 `--network=host`，客户端直接连宿主机 `127.0.0.1:9000`。
-评测复用采集时的场景随机化与 TF 成功判定（球与容器水平距离 <7cm 且落底），结果写入 `eval_results.json`。
-
-## 第 5 步（可选）：真机评测
-
-真机走官方 ROS2 SDK 高层接口（`set_joints_position` filter 模式），严禁直接发 `joint_space_command`。
-
-```bash
-# GPU 机器：起推理服务（与仿真评测同一个）
-python eval/serve_policy.py --ckpt <checkpoint>/pretrained_model
-
-# 机器人本体电脑（aarch64）：
-source /path/to/astribot_sdk_aarch64/env.sh
-python3 eval_client_real.py --server <GPU机器IP>:9000 --dry-run   # 先验证链路
-python3 eval_client_real.py --server <GPU机器IP>:9000             # 正式执行
-```
-
-安全机制：相邻两步动作限幅（`--max-delta`，默认 0.06 rad）、夹爪钳位 0-85、异常/Ctrl+C 自动 `stop_robot()`。首次务必 `--dry-run`，急停在手边。
-注意：仿真训练的策略因视觉域差距大概率无法直接在真机成功，此脚本首要作用是打通部署链路。
-
-## 常见问题
-
-- **`lerobot-train` 不存在**：老版本改用 `python -m lerobot.scripts.train`，参数一致。
-- **转换脚本 import 报错**：lerobot 不同版本包路径不同，脚本已做双路径兼容；仍报错时 `pip show lerobot` 确认版本并升级。
-- **评测时机器人乱动**：确认转换与评测的 state/action 布局一致、相机 topic 一致（`--camera`）、仿真为同一场景配置。
-- **成功率低**：先看训练 loss 是否收敛；再检查数据量（<50 条基本不行）；ACT 对相机视角一致性敏感，确认采集与评测的相机位姿相同。
-- **境内网络**：pip 用 aliyun 镜像；HuggingFace 一律 `HF_ENDPOINT=https://hf-mirror.com`。
-
-## 版本说明
-
-- LeRobot 数据集 v3 API（`create / add_frame / save_episode / finalize`），转换脚本对 v2（`consolidate`）做了回退兼容。
-- ACT 论文: [Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware](https://arxiv.org/abs/2304.13705)（ALOHA）。
-- LeRobot: <https://github.com/huggingface/lerobot>
+- 官方框架：`astribot_pi05`（训练/推理）、`astribot_eval`（真机执行）、`astribot_simulation`（仿真）
+- LeRobot：<https://github.com/huggingface/lerobot>
+- 支持：support@astribot.com

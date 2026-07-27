@@ -111,10 +111,11 @@ class FK:
             sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, n)
             if sid >= 0:
                 return "site", sid
-        # 退化：躯干最后一节 body
-        for i in (4, 3, 2, 1):
-            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY,
-                                    f"astribot_torso_link{i}")
+        # 退化：躯干最后一节 body（本模型命名为 astribot_torso_link_4，带下划线）
+        for n in ("astribot_torso_link_4", "astribot_torso_link_3",
+                  "astribot_torso_link_2", "astribot_torso_link_1",
+                  "astribot_torso_link4", "astribot_torso_link3"):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n)
             if bid >= 0:
                 return "body", bid
         sys.exit("[err] MJCF 找不到躯干参考系（torso site/body），请手工指定")
@@ -223,27 +224,37 @@ def main():
         if set(imgs) != set(CAM_MAP.values()):
             print(f"[warn] {os.path.basename(path)} 相机不齐，跳过")
             continue
-        for t in range(len(state)):
+        T = len(state)
+        if T == 0:
+            print(f"[warn] {os.path.basename(path)} 空 episode，跳过")
+            continue
+        for t in range(T):
             svec = build_vec(fk, state[t, :4], state[t, 4:11], state[t, 11], head2)
             avec = build_vec(fk, action[t, :4], action[t, 4:11], action[t, 11], head2)
-            frame = {STATE_KEY: svec, ACTION_KEY: avec}
+            # 严格 dtype：state/action float32，图像 uint8 连续内存（bundled lerobot 敏感）
+            frame = {STATE_KEY: np.asarray(svec, dtype=np.float32),
+                     ACTION_KEY: np.asarray(avec, dtype=np.float32)}
             for col in CAM_MAP.values():
-                frame[col] = imgs[col][t]
-            try:
-                dataset.add_frame({**frame, "task": prompt})
-            except (KeyError, ValueError, TypeError):
-                dataset.add_frame(frame)
-        try:
-            dataset.save_episode()
-        except TypeError:
-            dataset.save_episode(task=prompt)
-        n_frames += len(state)
-        print(f"[{i+1}/{len(files)}] {os.path.basename(path)}  帧数 {len(state)}")
+                frame[col] = np.ascontiguousarray(imgs[col][t], dtype=np.uint8)
+            # sub_task_index=[距子任务起点帧数, 距终点帧数]。单任务 episode 即整条：
+            # add_frame 不自动填此列，save_episode 会 np.stack 它，不填会报"空"
+            frame["sub_task_index"] = np.array([t, T - 1 - t], dtype=np.int64)
+            # pi05 内置 lerobot 签名：add_frame(frame, tasks:list[str], coarse_task:str)
+            dataset.add_frame(frame, tasks=[prompt], coarse_task=prompt)
+        dataset.save_episode(task=prompt)
+        n_frames += T
+        print(f"[{i+1}/{len(files)}] {os.path.basename(path)}  帧数 {T}")
 
     if hasattr(dataset, "finalize"):
         dataset.finalize()
     elif hasattr(dataset, "consolidate"):
-        dataset.consolidate()
+        # pi05 用自己的 compute_norm_stats 生成归一化，不需要 lerobot 内置 stats；
+        # 且 create() 构建的 dataset 缺 load_images 属性，compute_stats 会崩。
+        # run_compute_stats=False：完成必要整理(episode_data_index/视频/校验)，跳过统计。
+        try:
+            dataset.consolidate(run_compute_stats=False)
+        except TypeError:
+            dataset.consolidate()
     print(f"[done] {len(files)} 条 / {n_frames} 帧 -> {args.root}")
     print("下一步: 计算归一化统计 (compute_norm_stats)，再训练。见 pi05_README.md")
 

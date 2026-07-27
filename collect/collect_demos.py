@@ -43,6 +43,11 @@ from scripted_grasp import (Kinematics, GraspNode, START_ARM_LEFT, START_TORSO,
 RECORD_HZ = 30.0
 BALLS = {"red": "ball_red", "green": "ball_green", "blue": "ball_blue"}
 PROMPT_TPL = "pick the {color} ball and place it into the box"
+# 球生成范围（左臂可达工作区）。拉宽以破解"记忆平均动作"的因果混淆——
+# 范围越大，忽略视觉的平均动作越够不到球，模型被迫真正用相机定位。
+# 由 --spawn-x / --spawn-y 覆盖；采集时留意边缘位姿脚本专家的成功率。
+SPAWN_X = (0.58, 0.80)
+SPAWN_Y = (-0.02, 0.28)
 
 
 def parse_args():
@@ -64,6 +69,10 @@ def parse_args():
     p.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("DX", "DY", "DZ"),
                    help="抓取点相对球心补偿(m)，y 分量用于避开腕部蹭球，如 0 0.01 0")
+    p.add_argument("--spawn-x", type=float, nargs=2, default=None, metavar=("XMIN", "XMAX"),
+                   help="球生成 x 范围，覆盖默认 SPAWN_X")
+    p.add_argument("--spawn-y", type=float, nargs=2, default=None, metavar=("YMIN", "YMAX"),
+                   help="球生成 y 范围，覆盖默认 SPAWN_Y")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
@@ -194,9 +203,10 @@ def random_scene(node, max_retry=3):
     for attempt in range(max_retry):
         poses, taken = {}, []
         for name in BALLS.values():
-            for _ in range(50):
-                x = random.uniform(0.62, 0.76)
-                y = random.uniform(0.02, 0.24)
+            for _ in range(80):
+                # 大幅拓宽生成范围：逼模型用视觉定位而非记忆平均动作（破解因果混淆）
+                x = random.uniform(SPAWN_X[0], SPAWN_X[1])
+                y = random.uniform(SPAWN_Y[0], SPAWN_Y[1])
                 if all((x - a) ** 2 + (y - b) ** 2 > 0.07 ** 2 for a, b in taken):
                     taken.append((x, y))
                     poses[name] = [x, y, 0.80, 0, 0, 0, 1]     # 贴桌生成，不空投
@@ -292,6 +302,12 @@ def main():
     args = parse_args()
     if args.seed is not None:
         random.seed(args.seed)
+    global SPAWN_X, SPAWN_Y
+    if args.spawn_x is not None:
+        SPAWN_X = tuple(args.spawn_x)
+    if args.spawn_y is not None:
+        SPAWN_Y = tuple(args.spawn_y)
+    print(f"[scene] 球生成范围 x={SPAWN_X} y={SPAWN_Y}", flush=True)
     os.makedirs(args.out, exist_ok=True)
 
     kin = Kinematics(MJCF_PATH, args.site)
