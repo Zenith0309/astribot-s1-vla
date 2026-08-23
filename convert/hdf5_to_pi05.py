@@ -159,7 +159,9 @@ def build_vec(fk, torso4, arm7, grip, head2):
 
 def load_episode(path, resize, head_val):
     with h5py.File(path, "r") as f:
-        state = np.asarray(f["state"], dtype=np.float32)      # (T,12) torso4+arm7+grip1
+        # 宽度 12 = 旧格式 torso4+arm7+grip1（head 缺失，只能用 head_val 兜底）
+        # 宽度 14 = v3 起的新格式，末两维是真实的 head 关节角，必须用它
+        state = np.asarray(f["state"], dtype=np.float32)
         action = np.asarray(f["action"], dtype=np.float32)
         imgs = {}
         for key in f["images"]:
@@ -182,8 +184,22 @@ def load_episode(path, resize, head_val):
         if isinstance(prompt, bytes):
             prompt = prompt.decode()
     T = min([len(state), len(action)] + [len(v) for v in imgs.values()])
-    head2 = np.asarray(head_val, dtype=np.float32)
-    return state[:T], action[:T], {k: v[:T] for k, v in imgs.items()}, str(prompt), head2
+    if state.shape[1] >= 14:
+        # 新格式：逐帧的真实 head 角度（state/action 各自的末两维）
+        head_s = state[:T, 12:14]
+        head_a = action[:T, 12:14]
+    else:
+        # 旧格式（12 维）：head 从未记录，只能用常量兜底。
+        # ⚠️ 这样训出来的模型无法从图像定位物体——头部相机在跟踪目标时，
+        #    像素位置 = f(物体世界位置, 头部朝向)，缺了朝向就反解不出来。
+        #    详见 eval/ball_info_check.py 的实测（相关性 |r|<0.17）。
+        c = np.asarray(head_val, dtype=np.float32)
+        head_s = np.tile(c, (T, 1))
+        head_a = head_s
+        print(f"[warn] {os.path.basename(path)} 是旧格式(state 宽度 {state.shape[1]})，"
+              f"head 用常量 {head_val} 兜底；模型将无法从图像定位物体", flush=True)
+    return (state[:T], action[:T], {k: v[:T] for k, v in imgs.items()},
+            str(prompt), head_s, head_a)
 
 
 def main():
@@ -220,7 +236,8 @@ def main():
 
     n_frames = 0
     for i, path in enumerate(files):
-        state, action, imgs, prompt, head2 = load_episode(path, args.resize, args.head)
+        state, action, imgs, prompt, head_s, head_a = load_episode(
+            path, args.resize, args.head)
         if set(imgs) != set(CAM_MAP.values()):
             print(f"[warn] {os.path.basename(path)} 相机不齐，跳过")
             continue
@@ -229,8 +246,9 @@ def main():
             print(f"[warn] {os.path.basename(path)} 空 episode，跳过")
             continue
         for t in range(T):
-            svec = build_vec(fk, state[t, :4], state[t, 4:11], state[t, 11], head2)
-            avec = build_vec(fk, action[t, :4], action[t, 4:11], action[t, 11], head2)
+            # head 用逐帧真实值：state 与 action 各取自己的那一份
+            svec = build_vec(fk, state[t, :4], state[t, 4:11], state[t, 11], head_s[t])
+            avec = build_vec(fk, action[t, :4], action[t, 4:11], action[t, 11], head_a[t])
             # 严格 dtype：state/action float32，图像 uint8 连续内存（bundled lerobot 敏感）
             frame = {STATE_KEY: np.asarray(svec, dtype=np.float32),
                      ACTION_KEY: np.asarray(avec, dtype=np.float32)}

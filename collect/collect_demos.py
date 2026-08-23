@@ -46,8 +46,9 @@ PROMPT_TPL = "pick the {color} ball and place it into the box"
 # 球生成范围（左臂可达工作区）。拉宽以破解"记忆平均动作"的因果混淆——
 # 范围越大，忽略视觉的平均动作越够不到球，模型被迫真正用相机定位。
 # 由 --spawn-x / --spawn-y 覆盖；采集时留意边缘位姿脚本专家的成功率。
-SPAWN_X = (0.58, 0.80)
-SPAWN_Y = (-0.02, 0.28)
+# v2 实采用值（2026-07-28 那批 296 条就是用这个范围采的）：各 40cm，实测脚本专家成功率 296/300
+SPAWN_X = (0.48, 0.88)
+SPAWN_Y = (-0.05, 0.35)
 
 
 def parse_args():
@@ -165,8 +166,16 @@ class CollectorNode(GraspNode):
             if not self._rec_on:
                 break
             if self.arm_q is not None and self.torso_q is not None:
-                state = list(self.torso_q[:4]) + list(self.arm_q[:7]) + [self.grip_state]
-                action = list(self.last_cmd["torso"]) + list(self.last_cmd["arm"]) + [self.last_cmd["grip"]]
+                # 头部两维必须记下来：头部相机在跟踪目标，球的像素位置 =
+                # f(球世界位置, 头部朝向)。少了朝向，模型无法从图像反解球在世界何处
+                # （实测：像素位置与世界位置相关性 |r|<0.17，等于没有位置信息）。
+                # 31 维 SO3 布局里 head 本来就占 [29:31]，这里补齐即可。
+                head_s = list(self.head_q[:2]) if self.head_q is not None else [0.0, 0.0]
+                head_c = list(self._head_cmd[:2]) if self._head_cmd is not None else head_s
+                state = (list(self.torso_q[:4]) + list(self.arm_q[:7])
+                         + [self.grip_state] + head_s)
+                action = (list(self.last_cmd["torso"]) + list(self.last_cmd["arm"])
+                          + [self.last_cmd["grip"]] + head_c)
                 kin.sync(self.arm_q, self.torso_q, self.chassis_q)
                 tcp, _ = kin.ee_pose()
                 self._rec_buf["t"].append(time.time())
@@ -376,7 +385,9 @@ def main():
                 save_episode(fname, buf, {
                     "prompt": prompt, "target": ball_name, "success": success,
                     "fps": RECORD_HZ, "error": error,
-                    "state_layout": "torso4+arm_left7+gripper_left1",
+                    # v3 起加入 head2（原为 torso4+arm_left7+gripper_left1 共 12 维）。
+                    # 转换脚本按宽度自动识别新旧格式。
+                    "state_layout": "torso4+arm_left7+gripper_left1+head2",
                     "gripper_scale": "0-100, 0=open",
                 })
                 print(f"[saved] {fname}")

@@ -53,6 +53,11 @@ TORSO_STATE_TOPIC = "/astribot_torso/joint_space_states"
 TORSO_JOINTS = [f"astribot_torso_joint_{i}" for i in range(1, 5)]
 CHASSIS_JOINTS = ["astribot_chassis_x", "astribot_chassis_y", "astribot_chassis_zrot"]
 CHASSIS_STATE_TOPIC = "/astribot_chassis/joint_space_states"
+CHASSIS_CMD_TOPIC = "/astribot_chassis/joint_space_command"
+# 站位标定：球应落在底盘前向/左向的这个相对位置（当前固定站位抓取成功区间的中心，
+# 即手臂已验证的甜点相对位置）。任何球位都把底盘移到复现此相对位置的站位。
+STANDOFF_FWD = 0.69       # 球相对底盘的前向(x)距离
+STANDOFF_LAT = 0.13       # 球相对底盘的左向(y)距离
 WORLD_FRAME = "simulation"
 
 CTRL_HZ = 50.0            # 指令发布频率（仿真时间）
@@ -82,6 +87,10 @@ def parse_args():
     p.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("DX", "DY", "DZ"),
                    help="抓取点相对球心的补偿(m)。使用官方TCP(arm_left_tool)后默认无需补偿")
+    p.add_argument("--no-base", action="store_true", help="禁用底盘站位（回到固定底盘旧行为）")
+    p.add_argument("--standoff", type=float, nargs=2, default=[STANDOFF_FWD, STANDOFF_LAT],
+                   metavar=("FWD", "LAT"),
+                   help="站位时球相对底盘的前向/左向距离(m)，默认为甜点标定值")
     return p.parse_args()
 
 
@@ -308,6 +317,7 @@ class GraspNode(Node):
         self.torso_pub = self.create_publisher(RobotJointController, TORSO_CMD_TOPIC, 10)
         self.arm_r_pub = self.create_publisher(RobotJointController, ARM_RIGHT_CMD_TOPIC, 10)
         self.head_pub = self.create_publisher(RobotJointController, HEAD_CMD_TOPIC, 10)
+        self.chassis_pub = self.create_publisher(RobotJointController, CHASSIS_CMD_TOPIC, 10)
         self.arm_r_q, self.head_q = None, None
         self.create_subscription(RobotJointState, ARM_RIGHT_STATE_TOPIC,
                                  lambda m: setattr(self, "arm_r_q", list(m.position)[:7]), 10)
@@ -513,6 +523,28 @@ class GraspNode(Node):
                         "arm_r": [0.0]*7, "head": [0.0]*2}, duration)
         self.send_grip(0.0)
 
+    def send_chassis(self, q):
+        msg = RobotJointController()
+        msg.mode = 1
+        msg.command = [float(v) for v in q]     # [x, y, zrot]
+        self.chassis_pub.publish(msg)
+
+    def move_base_to(self, target_xyyaw, duration=3.0):
+        """底盘 min-jerk 平移/转向到目标 [x, y, yaw]（世界系）。"""
+        cur = np.asarray(self.chassis_q[:3] if self.chassis_q is not None else [0.0, 0.0, 0.0])
+        tgt = np.asarray(target_xyyaw, dtype=float)
+        steps = max(2, int(duration * CTRL_HZ))
+        for i in range(steps + 1):
+            s = i / steps
+            k = 10 * s**3 - 15 * s**4 + 6 * s**5
+            self.send_chassis(cur + k * (tgt - cur))
+            self.sim_sleep(1.0 / CTRL_HZ)
+
+    def station_for_ball(self, ball_xy, fwd=STANDOFF_FWD, lat=STANDOFF_LAT):
+        """算把球摆到手臂甜点相对位置所需的底盘站位 [x, y, yaw=0]。
+        底盘世界系：base_x = ball_x - fwd（球在前方 fwd 处），base_y = ball_y - lat。"""
+        return [float(ball_xy[0]) - fwd, float(ball_xy[1]) - lat, 0.0]
+
     def move_smooth(self, a_from, a_to, t_from, t_to, duration):
         """手臂+躯干同步 min-jerk 插值，50Hz 发布。"""
         a_from, a_to = np.asarray(a_from), np.asarray(a_to)
@@ -614,6 +646,18 @@ def main():
         node.move_to_start(4.0)
         q_now = list(START_ARM_LEFT)
         torso_now = list(START_TORSO)
+
+        # 底盘站位：根据球位移动底盘，把球摆到手臂甜点相对位置（近身球不再大幅弯腰）
+        if not args.no_base:
+            station = node.station_for_ball(ball[:2], args.standoff[0], args.standoff[1])
+            print(f"[state] 0b 底盘站位 -> (x,y,yaw)={np.round(station,3)} (球@{np.round(ball[:2],3)})")
+            node.move_base_to(station, duration=3.0)
+            node.sim_sleep(0.5)
+            if node.chassis_q is not None:
+                kin.chassis_now = list(node.chassis_q)
+                print(f"[info] 站位后底盘实际 = {np.round(node.chassis_q,3)}，已纳入运动学")
+            ball = node.object_pos(args.ball)   # 底盘动后球的世界位姿不变，刷新一下取新鲜值
+            box = node.object_pos(args.container)
 
         if not hasattr(node, "empty_tq"):
             node.calibrate_gripper()          # 空载力矩曲线标定（每进程一次，手举空中时）
