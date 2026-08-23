@@ -35,7 +35,7 @@ from websockets.sync.client import connect as ws_connect
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "collect"))
 from collect_demos import CollectorNode, random_scene, check_success, BALLS, PROMPT_TPL  # noqa: E402
 from scripted_grasp import (Kinematics, MJCF_PATH, START_ARM_RIGHT,  # noqa: E402
-                            START_ARM_LEFT, START_TORSO)
+                            START_ARM_LEFT, START_TORSO, STATE_HZ)
 
 # ---- pi05 观测键（与训练数据列名一致） ----
 STATE_KEY = "cartesian_so3_dict.cartesian_pose_state"
@@ -175,6 +175,12 @@ def parse_args():
     p.add_argument("--close", type=float, default=70.0, dest="grip_close")
     p.add_argument("--seg-time", type=float, default=2.5)
     p.add_argument("--hold-min", type=float, default=62.0)
+    p.add_argument("--trace-every", type=int, default=0, metavar="N",
+                   help="每 N 步记录一次预测目标（配合 --dump-obs 同时存图），"
+                        "用于定位闭环从第几步开始发散")
+    p.add_argument("--dump-obs", default=None, metavar="DIR",
+                   help="把每条 episode 首帧实际发给模型的三路图像存到 DIR，用于核对"
+                        "评测观测是否与训练分布一致（排查'模型输出恒定'类问题）")
     args = p.parse_args()
     args.cameras = [f"/astribot_whole_body/camera/{c}/image_raw" for c in CAM_KEYS]
     return args
@@ -198,19 +204,39 @@ def build_obs(node, fk, prompt):
         # processor 期望 CHW float[0,1]（与训练时 LeRobot 输出一致，不是 HWC uint8）
         chw = np.ascontiguousarray(rgb.transpose(2, 0, 1)).astype(np.float32) / 255.0
         imgs[CAM_KEYS[short]] = chw
-    state31 = fk.state31(node.torso_q[:4], node.arm_q[:7], node.grip_state)
+    # head 两维必须发真实值，与训练侧一致（v3 起数据里记录了真实 head 角度）。
+    # 训练时若 head 是常量、评测时给真实值（或反之）都会造成分布不匹配。
+    head2 = tuple(node.head_q[:2]) if getattr(node, "head_q", None) is not None else (0.0, 0.0)
+    state31 = fk.state31(node.torso_q[:4], node.arm_q[:7], node.grip_state, head2)
     # 官方 output_config 的 state 规范是 34 维：末尾追加 chassis [x,y,yaw]。
     # select_pad 只读 0:31（模型输入不变），post_process 的 output_extract 需要满 34 维。
     chassis = node.chassis_q if node.chassis_q is not None else [0.0, 0.0, 0.0]
     state = np.concatenate([state31, np.asarray(chassis[:3], dtype=np.float32)]).astype(np.float32)
     obs = {STATE_KEY: state, "prompt": prompt}
+    # obs_timestamp（仿真秒）：RtcPolicy 靠它算「上次推理后实际执行了几步」。
+    # 不发这个字段时 _calculate_execute_steps() 直接 return 1，RTC 前缀只按 1 步偏移，
+    # 而我们实际执行 exec_steps 步 —— 每次错位 (exec_steps-1) 步并不断累积，
+    # 预测会彻底跑偏（实测中位误差 34cm）。用仿真时钟而非墙钟，与训练时序一致。
+    obs["obs_timestamp"] = float(node._tick) / STATE_HZ
     obs.update(imgs)
     return obs
 
 
-def run_episode(node, kin, fk, link, args, ball_name, prompt):
+def run_episode(node, kin, fk, link, args, ball_name, prompt, probe=None):
+    """probe: 可选 dict，回填第一次推理的动作特征，用于诊断因果混淆。
+
+    只看成功率会被"球恰好落在记忆的平均动作附近"骗到。真正的判据是
+    【模型输出是否随球位变化】——所以这里记录首个 action chunk 的左臂
+    目标位置 a[9:12]，配合 episode 记录的球位，事后算相关性即可判定。
+    """
     q_now, torso_now = list(START_ARM_LEFT), list(START_TORSO)
     step = 0
+    ik_ok = ik_fail = 0          # IK 成败计数：全失败 -> 机器人不动 -> 状态不变 -> 死锁
+    tcp_trace = []               # 模型指令目标的游走范围
+    # 抓取判据要看【实际到达】而非【指令】：训练数据的指令位置本身相对球心偏了一个
+    # 跟踪误差（采集时 goto(aim - delta) 的闭环修正），模型学到的就是带偏移的指令。
+    best_d = 1e9                 # 实际末端到球的最小距离
+    best_at = None
     while step < MAX_STEPS:
         obs = build_obs(node, fk, prompt)
         if obs is None:
@@ -218,20 +244,83 @@ def run_episode(node, kin, fk, link, args, ball_name, prompt):
             continue
         actions = link.infer(obs)["actions"]          # (H, 31)
         actions = np.asarray(actions, dtype=np.float32)
+        # 每隔 --trace-every 步记一次「预测目标 + 图像」，用于定位闭环从第几步开始发散
+        if probe is not None and probe.get("trace_every"):
+            _te = probe["trace_every"]
+            if step % _te < args.exec_steps:
+                probe.setdefault("trace", []).append(
+                    [step, [round(float(v), 4) for v in actions[0, 9:12]]])
+                if probe.get("dump_dir"):
+                    import os as _os
+                    _d = _os.path.join(probe["dump_dir"], f"ep{probe.get('ep',0):02d}")
+                    _os.makedirs(_d, exist_ok=True)
+                    _hk = "images_dict.head.rgb"
+                    if _hk in obs:
+                        _im = (np.asarray(obs[_hk]).transpose(1, 2, 0) * 255).astype(np.uint8)
+                        cv2.imwrite(_os.path.join(_d, f"step{step:04d}_head.png"),
+                                    cv2.cvtColor(_im, cv2.COLOR_RGB2BGR))
+        if probe is not None and probe.get("dump_dir") and "first_action_xyz" not in probe:
+            # 存下真正发给模型的图（CHW float[0,1] -> HWC uint8）
+            import os as _os
+            _os.makedirs(probe["dump_dir"], exist_ok=True)
+            for _k, _v in obs.items():
+                if _k.startswith("images_dict"):
+                    _im = (np.asarray(_v).transpose(1, 2, 0) * 255).astype(np.uint8)
+                    _n = _k.replace("images_dict.", "").replace(".rgb", "")
+                    cv2.imwrite(_os.path.join(probe["dump_dir"],
+                                f"ep{probe.get('ep',0):02d}_{_n}.png"),
+                                cv2.cvtColor(_im, cv2.COLOR_RGB2BGR))
+        if probe is not None and "first_action_xyz" not in probe:
+            # 首个 chunk 的左臂目标位置（模型"想去哪"），以及该 chunk 内的位移幅度
+            probe["first_action_xyz"] = [round(float(v), 4) for v in actions[0, 9:12]]
+            probe["chunk_span_cm"] = round(
+                float(np.linalg.norm(actions[-1, 9:12] - actions[0, 9:12]) * 100), 2)
         for a in actions[:args.exec_steps]:
             # left_arm 段：pos[9:12] + 6D 旋转[12:18] → 6D IK
             kin.target_mat = so3_to_matrix(a[12:18])
             ok, t_t, q_t = kin.ik_position(a[9:12], q_now, torso_now)
             if ok:
+                ik_ok += 1
                 node.send_torso(t_t)
                 node.send_arm(q_t)
                 q_now, torso_now = list(q_t), list(t_t)
+            else:
+                ik_fail += 1
+            if step % 60 == 0:
+                tcp_trace.append([round(float(v), 4) for v in a[9:12]])
+            if step % 10 == 0:      # 实际末端 vs 球：抓取到底有没有到位
+                try:
+                    _b = np.asarray(node.object_pos(ball_name, timeout=0.5))
+                    kin.sync(node.arm_q, node.torso_q, node.chassis_q)
+                    _ee, _ = kin.ee_pose()
+                    if _ee is not None:
+                        _d = float(np.linalg.norm(np.asarray(_ee) - _b))
+                        if _d < best_d:
+                            best_d, best_at = _d, step
+                except (RuntimeError, TypeError):
+                    pass
             node.send_grip(float(np.clip(a[18] * 100.0, 0.0, GRIP_MAX)))
             node.sim_sleep(1.0 / 30.0)
             step += 1
             if step % 30 == 0 and check_success(node, ball_name):
+                _fin(probe, ik_ok, ik_fail, tcp_trace, best_d, best_at)
                 return True, step
+    _fin(probe, ik_ok, ik_fail, tcp_trace, best_d, best_at)
     return check_success(node, ball_name), step
+
+
+def _fin(probe, ik_ok, ik_fail, tcp_trace, best_d=None, best_at=None):
+    """回填执行侧诊断：IK 成功率 + 模型目标点的实际游走范围。"""
+    if probe is None:
+        return
+    probe["ik_ok"] = ik_ok
+    probe["ik_fail"] = ik_fail
+    if best_d is not None and best_d < 1e8:
+        probe["closest_cm"] = round(best_d * 100, 2)     # 实际末端最接近球的距离
+        probe["closest_at_step"] = best_at
+    if len(tcp_trace) >= 2:
+        t = np.asarray(tcp_trace, dtype=float)
+        probe["target_range_cm"] = [round(float(v) * 100, 2) for v in (t.max(0) - t.min(0))]
 
 
 def main():
@@ -239,7 +328,11 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
-    link = PI05Link(args.server)
+    # 每条 episode 重连一次：服务端 _handler 在新连接时会 self._policy.reset()，
+    # 清掉上一条 episode 残留的策略状态（如 RTC 动作前缀）。
+    # 官方注释原话："New connection = new episode"。复用一条连接跑多个 episode，
+    # 会让第 2 条起被上一条的动作前缀污染。
+    link = None
     fk = StateFK()
     kin = Kinematics(MJCF_PATH, args.site)
 
@@ -257,6 +350,12 @@ def main():
         node.wait_ready()
         for ep in range(args.episodes):
             print(f"\n===== pi05 Eval {ep+1}/{args.episodes} =====")
+            if link is not None:            # 新 episode 换新连接 -> 服务端 reset 策略状态
+                try:
+                    link.ws.close()
+                except Exception:
+                    pass
+            link = PI05Link(args.server)
             node.track_object = None
             node.move_to_start(3.0)
             node.send_grip(0.0)
@@ -271,20 +370,62 @@ def main():
             if node.chassis_q is not None:
                 kin.chassis_now = list(node.chassis_q)
 
+            # 记录球的初始位置：判定"动作是否随球位变化"的自变量
+            try:
+                ball_pos = [round(float(v), 4)
+                            for v in node.object_pos(ball_name, timeout=2.0)]
+            except RuntimeError:
+                ball_pos = None
+
             t0 = time.time()
-            success, steps = run_episode(node, kin, fk, link, args, ball_name, prompt)
+            probe = {"ep": ep, "dump_dir": args.dump_obs,
+                     "trace_every": args.trace_every}
+            success, steps = run_episode(node, kin, fk, link, args, ball_name,
+                                         prompt, probe=probe)
             n_ok += int(success)
-            results.append({"episode": ep, "color": color, "success": success,
-                            "steps": steps})
+            # bool(): check_success 返回 numpy.bool_，json 不认
+            for _k in ("dump_dir", "ep", "trace_every"):         # 仅内部用
+                probe.pop(_k, None)
+            results.append({"episode": ep, "color": color, "success": bool(success),
+                            "steps": int(steps), "ball_pos": ball_pos, **probe})
             print(f"[result] success={success} 步数{steps} 用时{time.time()-t0:.1f}s "
                   f"累计 {n_ok}/{ep+1}")
     finally:
         import json
         rate = n_ok / max(1, len(results))
         print(f"\n[eval done] {n_ok}/{len(results)} 成功率 {rate:.1%}")
+
+        # ---- 因果混淆判据：模型的目标位置是否随球位变化 ----
+        diag = {}
+        pts = [(r["ball_pos"], r.get("first_action_xyz")) for r in results
+               if r.get("ball_pos") and r.get("first_action_xyz")]
+        if len(pts) >= 3:
+            b = np.array([p[0] for p in pts], dtype=float)[:, :2]   # 球 xy
+            a = np.array([p[1] for p in pts], dtype=float)[:, :2]   # 目标 xy
+            act_std = a.std(axis=0)
+            diag = {
+                "n": len(pts),
+                "ball_xy_std_cm": [round(float(v) * 100, 2) for v in b.std(axis=0)],
+                "action_xy_std_cm": [round(float(v) * 100, 2) for v in act_std],
+                "corr_x": round(float(np.corrcoef(b[:, 0], a[:, 0])[0, 1]), 3)
+                          if act_std[0] > 1e-6 else None,
+                "corr_y": round(float(np.corrcoef(b[:, 1], a[:, 1])[0, 1]), 3)
+                          if act_std[1] > 1e-6 else None,
+            }
+            print(f"[diag] 球位 xy 标准差 {diag['ball_xy_std_cm']} cm")
+            print(f"[diag] 模型目标 xy 标准差 {diag['action_xy_std_cm']} cm")
+            print(f"[diag] 相关系数 x={diag['corr_x']} y={diag['corr_y']}")
+            if max(act_std) * 100 < 1.0:
+                print("[diag] ⚠️ 目标位置几乎不变（<1cm）→ 仍在输出记忆的平均动作，"
+                      "因果混淆未破解")
+            elif (diag["corr_x"] or 0) > 0.5 or (diag["corr_y"] or 0) > 0.5:
+                print("[diag] ✅ 目标位置随球位变化且正相关 → 模型在用视觉定位")
+            else:
+                print("[diag] ⚠️ 目标位置有变化但与球位不相关 → 可能在跟随别的信号")
+
         with open("pi05_eval_results.json", "w") as f:
-            json.dump({"success_rate": rate, "episodes": results}, f,
-                      ensure_ascii=False, indent=2)
+            json.dump({"success_rate": rate, "diagnosis": diag,
+                       "episodes": results}, f, ensure_ascii=False, indent=2)
         try:
             executor.shutdown(timeout_sec=1.0)
             node.destroy_node()
