@@ -1,19 +1,37 @@
 # pi05 推理服务配置 — 星尘 S1 仿真抓球
 # 放到 astribot_pi05-main/astribot_pi05/configs/infer_example/ 下用 infer.sh 引用
 
-checkpoint: "outputs/pi05_pick_ball/checkpoint-30000"   # 改成你要评测的 checkpoint
+# checkpoint 路径规律：<output_dir>/<训练配置名>/checkpoint-<步数>
+#   v2 重训（train_pick_ball_v2，共 16000 步，每 2000 存一次）：
+#     /data0/tzs/astribot/astribot_pi05/outputs/pi05_pick_ball/train_pick_ball_v2/checkpoint-{2000..16000}
+#   v1 对照（train_pick_ball，已有 20000/25000/30000）：
+#     /data0/tzs/astribot/astribot_pi05/outputs/pi05_pick_ball/train_pick_ball/checkpoint-30000
+# 评测建议从中段扫起（8000/10000/12000/16000），除了成功率，重点看【动作是否随球位变化】
+# ——不变才是因果混淆没破解，成功率单看可能被"球恰好落在平均动作附近"骗到。
+checkpoint: "/data0/tzs/astribot/astribot_pi05/outputs/pi05_pick_ball/train_pick_ball_v2/checkpoint-10000"
+
 attn_implementation: "flash_attention_2"   # 没装 flash-attn 改 "eager"
 torch_dtype: "bfloat16"
 
 port: 8000
 host: "0.0.0.0"
-server_type: "async"
+
+# 评测必须用 sync：单客户端顺序推理，协议简单，pi05_eval_client.py 就是按 sync 写的。
+# async 是真机高频部署的 RTC 双流架构，评测客户端连上后会「不动」（已知坑）。
+server_type: "sync"
 
 policy_kwargs:
   warm_up_model: true
   seed: 42
 
 inference_kwargs:
-  rtc_delay: 3            # RTC 滚动预测保留步数
+  # ⚠️ 评测必须 rtc_delay: 0。policy.py 里 `cls = RtcPolicy if rtc_delay > 0 else Policy`——
+  # 只要 >0 就走有状态的 RtcPolicy，它用 self._last_absolute_actions 把上一次的动作作为
+  # 前缀条件，且 execute_steps 由 obs["obs_timestamp"] 反推。我们的评测客户端不发
+  # obs_timestamp，前缀就会用错步长、跨请求累积漂移。
+  # 实测代价：同一份训练帧，rtc_delay=3 复用连接时预测中位误差 34.4cm；
+  #           改 0（或每次重连）后降到 0.35cm。闭环评测因此从 0% 成功变成可用。
+  # RTC 是给真机高频部署用的（那边会正确提供时间戳），评测别开。
+  rtc_delay: 0
   denoise_num_steps: 10   # Flow Matching 去噪步数
   action_horizon: 32

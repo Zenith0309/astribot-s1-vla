@@ -1,0 +1,89 @@
+# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」v3
+#
+# 与 v2 的区别：起点从裸底座换成官方【已微调好的抓放模型】，并对齐官方训练配方。
+#
+#   起点   pi05_base_bfloat16(裸底座)  ->  pi05_pnp/checkpoint-100000
+#   actions 归一化  quantile  ->  mean_std        （官方 processor_config 用的就是 mean_std）
+#   峰值 lr        3e-5      ->  5e-5            （由官方 trainer_state 反推出的峰值）
+#   warmup         500       ->  1000            （官方 step50 时 lr=2.45e-6，线性反推≈1000；
+#                                                  且 warm start 从已训好的权重出发，warmup 长一点更稳）
+#   min_lr         3e-6      ->  5e-6            （维持官方的 峰值/10 比例）
+#
+# 关于起点 pi05_pnp（官方 2026-08 提供）：
+#   - 真机抓放数据训练 100000 步 / 26 epochs / 206,172 帧 / 21 个数据集
+#     （含 74/75/76cm 三档桌高、night 夜间光照等随机化）
+#   - fm_loss 由 1.363 降到 0.0052
+#   - 架构与裸底座完全一致（812 个同名张量），仅多 lm_head.weight（+1.05G），可直接当起点
+#   - 官方自己是全参微调（train_expert_only=false, freeze_vision_encoder=false），
+#     但 4090 显存放不下，我们下面用 model_kwargs 覆盖成冻结主干（覆盖机制见下）
+#
+# ⚠️ model_kwargs 的覆盖语义（trainer/config.py:58 -> train.py:84 的 AutoConfig.from_pretrained）：
+#    这里列出的键会【覆盖】checkpoint 自带 config.json 的同名值；
+#    没列出的键则【继承】checkpoint 的值。pi05_pnp 的 config.json 里有
+#    training_time_rtc=true / rtc_max_delay=6 / GPU_memory_opt_level=0，
+#    为避免静默继承，下面把想要的值全部显式写出。
+#
+# ⚠️ processor 不会从 checkpoint 目录加载（train.py 里 AutoProcessor.from_pretrained 分支是注释掉的），
+#    完全由本文件的 processor_kwargs 构建。因此：
+#      - pi05_pnp 自带的 wrc_pnp 真机 norm_stats 不会被误用（好事）
+#      - 它自带的 tokenizer 也不会被使用，仍走 processor_pi05.py 里指向本地魔搭副本的补丁
+#
+# 用法（compute 与 train 必须引用同一份同名配置；norm 已从 v2 复制，无需重算）：
+#   cd /data0/tzs/astribot/astribot_pi05/astribot_pi05
+#   export PATH=/data0/miniconda3/bin:$PATH      # 否则 conda.sh 找不到 /data0/miniconda3 而秒退
+#   export HF_HUB_OFFLINE=1
+#   export CUDA_VISIBLE_DEVICES=2,3,4,5
+#   nohup bash scripts/train/train.sh -c configs/train_example/train_pick_ball_v3.yaml -n 4 > train_v3.log 2>&1 &
+
+### 模型：官方已微调的抓放 checkpoint 作为起点
+model_name_or_path: "/data0/tzs/astribot/cheakpoint/pi05_pnp/checkpoint-100000"
+attn_implementation: "flash_attention_2"   # 没装 flash-attn 就改 "eager"
+torch_dtype: "bfloat16"
+
+model_kwargs:
+  chunk_size: 32
+  freeze_vision_encoder: true       # 覆盖 pnp 的 false：296 条小数据 + 24G 卡，必须冻
+  train_expert_only: true           # 覆盖 pnp 的 false：只训动作 expert，省显存防过拟合
+  GPU_memory_opt_level: 1           # 覆盖 pnp 的 0；OOM 就改 2（开梯度检查点）
+  training_time_rtc: true           # 显式继承官方设置：训练时 RTC（随机 delay 0~6 置零时间前缀）
+  rtc_max_delay: 6                  # 显式继承官方值（框架默认是 5）
+  # 注：training_time_rtc 不需要数据里有额外字段，只是内部对 flow-matching 的 time 加掩码
+
+### Processor / 归一化
+processor_kwargs:
+  normalization_mode:
+    state: "quantile"
+    actions: "mean_std"             # 对齐官方；norm_stats.json 里 mean/std/q01/q99 都有，无需重算
+  # 必须绝对路径：compute_norm_stats.sh 与 train.sh 工作目录不同，相对路径会错位。
+  # 配置名 train_pick_ball_v3 的 norm 已从 v2 复制（同一数据集，md5 一致）。
+  normalization_base_path: "/data0/tzs/astribot/astribot_pi05/astribot_pi05/outputs/pi05_pick_ball/norm"
+  default_prompts:
+    astribot: "pick the ball and place it into the box"
+
+### 数据集：与 v2 同一份（296 条 / 180,201 帧 / 球生成区 41.8×40.4cm）
+robot_datasets:
+  - repo_id_list:
+      - ["pi05_pick_ball_v2", 0.9]  # 90% 训练 / 10% 验证
+    dataset_root: "/data0/tzs/astribot/datasets"
+
+### 训练
+deepspeed: "configs/deepspeed/zero2.json"
+max_steps: 16000                    # 16000 / save_steps 2000 = 8 个 checkpoint，全部保留
+per_device_train_batch_size: 2      # 每张 4090；OOM 降到 1
+gradient_accumulation_steps: 4      # 有效 batch = 2 × 4卡 × 4 = 32（与 v1 一致）
+dataloader_num_workers: 8
+
+learning_rate: !!float "5e-5"       # 对齐官方峰值
+lr_scheduler_type: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr: !!float "5e-6"            # 维持官方 峰值/10
+warmup_steps: 1000
+
+output_dir: "outputs/pi05_pick_ball"
+overwrite_output_dir: false
+save_steps: 2000
+save_total_limit: 8
+save_safetensors: true
+
+logging_steps: 25
+seed: 42

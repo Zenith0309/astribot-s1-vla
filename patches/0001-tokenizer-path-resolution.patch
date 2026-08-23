@@ -1,0 +1,97 @@
+diff --git a/astribot_pi05/pi05/models/pi05/processor_pi05.py b/astribot_pi05/pi05/models/pi05/processor_pi05.py
+index e9a0a19..031a1b4 100644
+--- a/astribot_pi05/pi05/models/pi05/processor_pi05.py
++++ b/astribot_pi05/pi05/models/pi05/processor_pi05.py
+@@ -1,6 +1,7 @@
+ import copy
+ import json
+ import logging
++import os
+ from pathlib import Path
+ from typing import Any, Callable, ClassVar, Literal, Sequence
+ 
+@@ -16,6 +17,67 @@ from pi05.utils.normalize import save
+ 
+ _STATE_DIGITIZE_BINS = np.linspace(-1.0, 1.0, 257, dtype=np.float32)[:-1]  # 256 bins
+ 
++# ---------------------------------------------------------------------------
++# tokenizer 来源解析
++#
++# 上游写死 hub id "google/paligemma-3b-pt-224"，境内直连常超时；此前本仓库把它改成
++# 某台机器的绝对路径（/home/<user>/.cache/...），导致换机器或换账号就崩，而且报错点
++# 在 processor 构造阶段，很难定位。改为按优先级解析，既不写死绝对路径也保持离线可用：
++#
++#   1. 显式参数 tokenizer_path（可由 YAML 的 processor_kwargs.tokenizer_path 传入）
++#   2. 环境变量 ASTRIBOT_TOKENIZER_PATH
++#   3. 本地常见位置（"~" 会展开，故对任何用户都成立）
++#   4. 都没有则回退 hub id，交给 transformers 去联网或报错
++#
++# 新机器上只需： export ASTRIBOT_TOKENIZER_PATH=<含 tokenizer.model 的目录>
++# ---------------------------------------------------------------------------
++_TOKENIZER_PATH_ENV = "ASTRIBOT_TOKENIZER_PATH"
++_TOKENIZER_HUB_ID = "google/paligemma-3b-pt-224"
++_TOKENIZER_LOCAL_CANDIDATES = (
++    "~/.cache/modelscope/models/AI-ModelScope--paligemma-3b-pt-224/snapshots/master",
++    "~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/master",
++)
++_TOKENIZER_VOCAB_FILES = ("tokenizer.model", "tokenizer.json")
++
++
++def _is_local_tokenizer_dir(path: str) -> bool:
++    """目录是否存在且含可用的 tokenizer 词表文件。"""
++    directory = Path(os.path.expanduser(str(path)))
++    if not directory.is_dir():
++        return False
++    return any((directory / name).is_file() for name in _TOKENIZER_VOCAB_FILES)
++
++
++def resolve_tokenizer_source(explicit: str | None = None) -> str:
++    """按优先级解析 tokenizer 来源，返回可直接传给 from_pretrained 的路径或 hub id。"""
++    _log = logging.getLogger(__name__)
++    env_value = os.environ.get(_TOKENIZER_PATH_ENV)
++    for candidate, origin in ((explicit, "tokenizer_path 参数"),
++                              (env_value, "环境变量 " + _TOKENIZER_PATH_ENV)):
++        if candidate:
++            expanded = os.path.expanduser(str(candidate))
++            if _is_local_tokenizer_dir(expanded):
++                _log.info("tokenizer 来源(%s): %s", origin, expanded)
++                return expanded
++            wanted = " 或 ".join(_TOKENIZER_VOCAB_FILES)
++            raise FileNotFoundError(
++                origin + " 指定的 tokenizer 目录不可用: " + str(candidate)
++                + " —— 该目录需存在且包含 " + wanted + " 之一。"
++            )
++
++    for candidate in _TOKENIZER_LOCAL_CANDIDATES:
++        if _is_local_tokenizer_dir(candidate):
++            expanded = os.path.expanduser(candidate)
++            _log.info("tokenizer 来源(本地候选): %s", expanded)
++            return expanded
++
++    _log.warning(
++        "未找到本地 tokenizer，回退 hub id %s；境内无网络会超时。"
++        "请下载词表后 export %s=<目录>。",
++        _TOKENIZER_HUB_ID, _TOKENIZER_PATH_ENV)
++    return _TOKENIZER_HUB_ID
++
++
+ @register_processor("pi05")
+ class Pi05Processor(ProcessorMixin, BaseProcessor):
+     """Processor for Pi05 VLA policies."""
+@@ -33,6 +95,7 @@ class Pi05Processor(ProcessorMixin, BaseProcessor):
+         normalization_stats_share: bool = True,
+         default_prompts: dict[str, str] | None = None,
+         max_token_length: int = 200,
++        tokenizer_path: str | None = None,
+         tokenizer: GemmaTokenizer | None = None,
+         phase: Literal["train", "eval"] = "train",
+         **kwargs: Any,
+@@ -69,7 +132,7 @@ class Pi05Processor(ProcessorMixin, BaseProcessor):
+         self.default_prompts = default_prompts
+         self.max_token_length = max_token_length
+         if tokenizer is None:
+-            tokenizer = GemmaTokenizer.from_pretrained("google/paligemma-3b-pt-224")
++            tokenizer = GemmaTokenizer.from_pretrained(resolve_tokenizer_source(tokenizer_path))
+         
+         self.input_transforms = self.build_input_transforms()
+         self.output_transforms = self.build_output_transforms()

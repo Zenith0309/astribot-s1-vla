@@ -1,0 +1,89 @@
+# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」v4
+#
+# ⚠️ 版本号对照（别搞混，配置名 v3 用的是数据集 v2）：
+#   训练配置              起点权重          数据集                 关键差异
+#   train_pick_ball       pi05_base(裸)     pi05_pick_ball  (137)  最初版，30000 步
+#   train_pick_ball_v2    pi05_base(裸)     pi05_pick_ball_v2(296) 宽分布，未跑
+#   train_pick_ball_v3    pi05_pnp(已微调)  pi05_pick_ball_v2(296) 跑完了，闭环 0%
+#   train_pick_ball_v4    pi05_pnp(已微调)  pi05_pick_ball_v3(~395) ← 本文件，state 含 head
+#
+# 为什么必须有 v4：v1~v3 的数据里 state 的 head 两维被写死为 [0,0]，而采集时头部相机
+# 一直在跟踪目标球，于是「球的像素位置 = f(球世界位置, 头部朝向)」缺了朝向这一项，
+# 观测里根本没有可用的位置信息。实测（eval/head_info_check.py，300 条留一法交叉验证）：
+#
+#   常数基线（永远猜均值）        16.39 cm
+#   只用像素位置                  16.23 cm   <- 与基线持平，信息量为零，这就是 v3 闭环 0% 的原因
+#   只用头部角度                   2.03 cm
+#   像素 + 头部 + 二次/交叉项      1.63 cm   <- v4 的情形，已进入抓取所需的 1~2cm 区间
+#
+# v3 起采集脚本记录真实 head 关节角（state_layout 由 12 维变 14 维），转换脚本按宽度
+# 自动识别并写进 state[29:31]。评测客户端也同步改为发真实 head，两端保持一致。
+#
+# 除数据集之外，其余超参与 train_pick_ball_v3.yaml 完全相同（那套已验证能正常收敛，
+# loss 124 -> 0.129 单调下降），这样唯一变量就是「观测里有没有位置信息」。
+#
+# 用法（compute 与 train 必须引用同一份同名配置）：
+#   cd /data0/tzs/astribot/astribot_pi05/astribot_pi05
+#   export PATH=/data0/miniconda3/bin:$PATH        # conda 根的 bin，否则 conda.sh 秒退
+#   export HF_HUB_OFFLINE=1
+#   bash scripts/train/compute_norm_stats.sh -c configs/train_example/train_pick_ball_v4.yaml
+#   export CUDA_VISIBLE_DEVICES=<4 张空闲卡>
+#   nohup bash scripts/train/train.sh -c configs/train_example/train_pick_ball_v4.yaml -n 4 > train_v4.log 2>&1 &
+#
+# 评测（这轮扫出来的最优配置，别用默认值）：
+#   infer 配置 rtc_delay: 0        （>0 会走有状态 RtcPolicy，跨请求污染，预测误差 34cm）
+#   评测客户端 --exec-steps 32     （8 会在起步死锁；16=19.4cm，32=9.4cm，越完整越好）
+
+### 模型：官方已微调的真机抓放 checkpoint 作为起点
+model_name_or_path: "/data0/tzs/astribot/cheakpoint/pi05_pnp/checkpoint-100000"
+attn_implementation: "flash_attention_2"
+torch_dtype: "bfloat16"
+
+model_kwargs:
+  chunk_size: 32
+  # 下面这些会【覆盖】pnp checkpoint 自带 config.json 的同名值；没列出的键会静默继承，
+  # 所以把在意的全部显式写出（pnp 原本是 train_expert_only=false 的全参微调，24G 卡放不下）
+  freeze_vision_encoder: true
+  train_expert_only: true
+  GPU_memory_opt_level: 1           # OOM 就改 2（开梯度检查点）
+  training_time_rtc: true           # 显式继承官方设置
+  rtc_max_delay: 6                  # 显式继承官方值（框架默认 5）
+
+### Processor / 归一化
+processor_kwargs:
+  normalization_mode:
+    state: "quantile"
+    actions: "mean_std"             # 对齐官方 processor_config
+  # 必须绝对路径：compute_norm_stats.sh 与 train.sh 工作目录不同，相对路径会错位
+  normalization_base_path: "/data0/tzs/astribot/astribot_pi05/astribot_pi05/outputs/pi05_pick_ball/norm"
+  default_prompts:
+    astribot: "pick the ball and place it into the box"
+
+### 数据集：v3 采集（含真实 head 两维）
+robot_datasets:
+  - repo_id_list:
+      - ["pi05_pick_ball_v3", 0.9]  # 90% 训练 / 10% 验证
+    dataset_root: "/data0/tzs/astribot/datasets"
+
+### 训练
+deepspeed: "configs/deepspeed/zero2.json"
+max_steps: 16000                    # 16000 / save_steps 2000 = 8 个 checkpoint，全部保留。
+                                    # 若评测发现最优点就是 16000（还在变好），说明该训更久。
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4      # 有效 batch = 2 × 4卡 × 4 = 32
+dataloader_num_workers: 8
+
+learning_rate: !!float "5e-5"
+lr_scheduler_type: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr: !!float "5e-6"
+warmup_steps: 1000
+
+output_dir: "outputs/pi05_pick_ball"
+overwrite_output_dir: false
+save_steps: 2000
+save_total_limit: 8
+save_safetensors: true
+
+logging_steps: 25
+seed: 42

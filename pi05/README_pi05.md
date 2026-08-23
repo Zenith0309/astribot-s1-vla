@@ -66,7 +66,8 @@ cp /path/to/astribot-act/pi05/train_pick_ball.yaml configs/train_example/
 # 按你的实际路径核对 yaml 里 model_name_or_path / dataset_root
 
 bash scripts/train/compute_norm_stats.sh -c configs/train_example/train_pick_ball.yaml
-# 会在 normalization_base_path (outputs/pi05_pick_ball/norm) 下生成 norm_stats.json
+# 会在 normalization_base_path (/data0/tzs/astribot/outputs/pi05_pick_ball/norm) 下生成 norm_stats.json
+# 注意：该路径必须是绝对路径，且 compute_norm_stats 与 train 用同一份同名配置
 ```
 
 ### 3. 训练

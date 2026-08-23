@@ -1,0 +1,73 @@
+# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」v2 重训
+#
+# 相对 v1（train_pick_ball.yaml）只改三件事，其余参数全部保持不变，
+# 这样"成功率是否上来"就能干净地归因到【数据分布+数量】这一个变量上：
+#   1. 数据集    pi05_pick_ball(137条/14×22cm) -> pi05_pick_ball_v2(296条/41.8×40.4cm)
+#   2. 训练步数  30000 -> 16000（数据变多但仍是小数据，防过拟合；v1 的 3w 步已判定过头）
+#   3. 存档密度  save_steps 5000/limit 3 -> 2000/limit 8（靠评测挑中间 checkpoint）
+#
+# 配置文件名 train_pick_ball_v2 会派生出独立的 norm 与 checkpoint 目录，
+# 因此不会覆盖 v1 产物，两版可直接对照评测：
+#   norm       -> <normalization_base_path>/train_pick_ball_v2/...
+#   checkpoint -> outputs/pi05_pick_ball/train_pick_ball_v2/checkpoint-*
+#
+# 用法（compute 与 train 必须引用同一份同名配置）：
+#   conda activate astribot_pi05 && export HF_HUB_OFFLINE=1
+#   cd /data0/tzs/astribot/astribot_pi05/astribot_pi05
+#   bash scripts/train/compute_norm_stats.sh -c configs/train_example/train_pick_ball_v2.yaml
+#   export CUDA_VISIBLE_DEVICES=<空闲卡>   # 共享机器，先 nvidia-smi 看清
+#   nohup bash scripts/train/train.sh -c configs/train_example/train_pick_ball_v2.yaml -n <卡数> > train_v2.log 2>&1 &
+
+### 模型
+model_name_or_path: "/data0/tzs/astribot/cheakpoint/pi05_base_bfloat16"  # 解压后的权重目录
+attn_implementation: "flash_attention_2"   # 没装 flash-attn 就改 "eager"
+torch_dtype: "bfloat16"
+
+model_kwargs:
+  chunk_size: 32
+  # ===== 多卡 4090 档（ZeRO-2 分片显存）=====
+  freeze_vision_encoder: true       # 296 条仍属小数据，继续冻结防过拟合
+  train_expert_only: true           # 只训动作 expert，冻结主干（省显存 + 稳）
+  GPU_memory_opt_level: 1           # 多卡分片后无需最狠的检查点；OOM 再改 2
+
+### Processor / 归一化
+processor_kwargs:
+  normalization_mode:
+    state: "quantile"
+    actions: "quantile"
+  # 必须绝对路径：compute_norm_stats.sh 与 train.sh 工作目录不同，相对路径会错位。
+  # 与 v1 共用同一个 norm 根目录，配置名会自动分出 train_pick_ball_v2 子目录，不冲突。
+  normalization_base_path: "/data0/tzs/astribot/astribot_pi05/astribot_pi05/outputs/pi05_pick_ball/norm"
+  default_prompts:
+    astribot: "pick the ball and place it into the box"
+
+### 数据集
+# v2 = demos_v2 里 2026-07-28 那次完整运行的 296 条（已排除 4 条参数不明的残留）
+# 转换命令见 convert/hdf5_to_pi05.py；实测球生成区 41.8×40.4cm，296/296 位置不重复
+robot_datasets:
+  - repo_id_list:
+      - ["pi05_pick_ball_v2", 0.9]  # 90% 训练 / 10% 验证
+    dataset_root: "/data0/tzs/astribot/datasets"   # 上级目录；实际集在 <root>/pi05_pick_ball_v2
+
+### 训练
+deepspeed: "configs/deepspeed/zero2.json"
+max_steps: 16000                    # 16000 / save_steps 2000 = 8 个 checkpoint，
+                                    # 正好等于 save_total_limit，一个都不会被轮换删掉
+per_device_train_batch_size: 2      # 每张 4090；OOM 降到 1
+gradient_accumulation_steps: 4      # 有效 batch = 2 × 卡数 × 4
+dataloader_num_workers: 8
+
+learning_rate: !!float "3e-5"
+lr_scheduler_type: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr: !!float "3e-6"
+warmup_steps: 500
+
+output_dir: "outputs/pi05_pick_ball"
+overwrite_output_dir: false
+save_steps: 2000                    # 密集存档：小数据集靠评测挑中间 checkpoint，别默认取最后一步
+save_total_limit: 8
+save_safetensors: true
+
+logging_steps: 25
+seed: 42

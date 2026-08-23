@@ -1,4 +1,14 @@
-# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」
+# pi05 微调配置 — 星尘 S1 仿真「抓球入箱」【v1 历史存档，请勿用它重训】
+#
+# 这份配置是 2026-07-26/27 训练第一版模型时实际跑的参数，原样保留作为对照记录。
+# v1 结果：137 条窄分布数据（14×22cm）+ 30000 步 → 因果混淆（忽略视觉，走记忆平均动作）。
+# 产物：outputs/pi05_pick_ball/train_pick_ball/checkpoint-{20000,25000,30000}
+#
+# ⚠️ norm 落点和 checkpoint 落点都由【配置文件名】派生：
+#      norm       -> <normalization_base_path>/<配置名>/...
+#      checkpoint -> <output_dir>/<配置名>/checkpoint-*
+#    所以复用这个文件名重训会覆盖 v1 产物。重训请用 train_pick_ball_v2.yaml。
+#
 # 放到 astribot_pi05-main/astribot_pi05/configs/train_example/ 下再用 train.sh 引用
 # 权重需先解压: unzip /data0/tzs/astribot/cheakpoint/pi05_base_bfloat16.zip -d /data0/tzs/astribot/cheakpoint/
 
@@ -10,7 +20,7 @@ torch_dtype: "bfloat16"
 model_kwargs:
   chunk_size: 32
   # ===== 多卡 4090 档（ZeRO-2 分片显存）=====
-  freeze_vision_encoder: true       # 冻结视觉编码器（150条小数据，冻结防过拟合）
+  freeze_vision_encoder: true       # 冻结视觉编码器（小数据，冻结防过拟合）
   train_expert_only: true           # 只训动作 expert，冻结主干（小数据+稳，也省显存）
   GPU_memory_opt_level: 1           # 多卡分片后无需最狠的检查点；OOM 再改 2
   # 若卡多且想更充分微调：train_expert_only=false（ZeRO-2 分片下 4090 可尝试）
@@ -20,7 +30,8 @@ processor_kwargs:
   normalization_mode:
     state: "quantile"
     actions: "quantile"
-  normalization_base_path: "outputs/pi05_pick_ball/norm"   # compute_norm_stats 会写到这里
+  # 必须绝对路径：compute_norm_stats.sh 与 train.sh 工作目录不同，相对路径会错位
+  normalization_base_path: "/data0/tzs/astribot/astribot_pi05/astribot_pi05/outputs/pi05_pick_ball/norm"
   default_prompts:
     astribot: "pick the ball and place it into the box"
 
@@ -33,7 +44,7 @@ robot_datasets:
 ### 训练
 # 多卡 4090：用 ZeRO-2 分片优化器/梯度；启动加 -n <卡数>
 deepspeed: "configs/deepspeed/zero2.json"
-max_steps: 30000                    # 150 条小数据集，3w 步足够；先看验证曲线
+max_steps: 30000                    # v1 实跑值。事后判定：对 137 条数据而言过头了
 per_device_train_batch_size: 2      # 每张 4090；OOM 降到 1
 gradient_accumulation_steps: 4      # 有效 batch = 2 × 卡数 × 4（如 4 卡 = 32）
 dataloader_num_workers: 8
@@ -46,7 +57,7 @@ warmup_steps: 500
 
 output_dir: "outputs/pi05_pick_ball"
 overwrite_output_dir: false
-save_steps: 5000
+save_steps: 5000                    # v1 实跑值，只留 3 个 checkpoint，挑选空间太小
 save_total_limit: 3
 save_safetensors: true
 
