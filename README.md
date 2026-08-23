@@ -22,23 +22,33 @@ astribot-s1-vla/
 │   ├── go_start_pose.py           #   回官方 VLA 初始姿态（最小控制示例）
 │   └── scene_*.xml                #   自定义场景（三色球 + 容器 + 第三人称相机）
 ├── convert/                       # 数据格式转换
-│   ├── hdf5_to_pi05.py            #   自采 HDF5 -> pi0.5 LeRobot（34维 SO3，FK 生成位姿）
+│   ├── hdf5_to_pi05.py            #   自采 HDF5 -> pi0.5 LeRobot（31维 SO3，FK 生成位姿）
 │   ├── hdf5_to_lerobot.py         #   自采 HDF5 -> ACT LeRobot（关节空间，快速基线）
 │   ├── official_hdf5_to_mcap.py   #   官方真机 HDF5 -> MCAP（Foxglove 审查用）
 │   └── hdf5_to_mcap.py            #   自采 HDF5 -> MCAP
 ├── train/
 │   └── train_act.sh               # ACT 训练（LeRobot 自带实现，快速基线）
-├── eval/
+├── eval/                          # 评测 + ⭐诊断工具（排障顺序见 docs 指南 §11）
+│   ├── pi05_eval_client.py        #   pi0.5 闭环评测（记录 closest_cm / IK 成败 / 预测轨迹）
+│   ├── head_info_check.py         #   ⭐⭐ 判观测里有没有物体位置信息（改观测设计后必跑）
+│   ├── replay_check.py            #   ⭐ 拿训练帧回放，分离"模型问题"与"评测管线问题"
+│   ├── obs_probe.py               #   对比评测/训练两端的观测分布（含存图肉眼比对）
+│   ├── openloop_replay.py         #   开环重放专家动作，隔离 IK/下发/时序故障
+│   ├── ball_info_check.py         #   从转换后数据集查像素位置与世界位置的相关性
 │   ├── serve_policy.py            #   ACT 推理服务（TCP + JSON）
 │   ├── eval_client.py             #   ACT 仿真评测客户端
-│   ├── pi05_eval_client.py        #   pi0.5 仿真评测客户端（msgpack/WebSocket + SO3->IK）
 │   └── eval_client_real.py        #   真机评测客户端（官方 SDK 高层接口）
+├── patches/                       # 打在官方框架上的补丁（重装框架后要重新 git apply）
 ├── pi05/
-│   ├── train_pick_ball.yaml       # pi0.5 训练配置（多卡 4090 档）
-│   ├── infer_pick_ball.yaml       # pi0.5 推理服务配置
+│   ├── train_pick_ball.yaml       # v1 训练配置（历史存档，勿覆盖其 norm/checkpoint）
+│   ├── train_pick_ball_v2.yaml    # 历史（裸底座 + 数据集v2）
+│   ├── train_pick_ball_v3.yaml    # 历史（pnp起点 + 数据集v2，闭环0%：观测缺信息）
+│   ├── train_pick_ball_v4.yaml    # ⭐ 当前用这个（pnp起点 + 数据集v3，state 含真实 head）
+│   ├── infer_pick_ball.yaml       # pi0.5 推理服务配置（server_type 必须 sync）
 │   └── README_pi05.md             # pi0.5 微调 Runbook
 ├── docs/
-│   └── pi05微调完整指南.md         # ⭐ 完整微调指南（数据采集/标注/转换/训练/评测/踩坑）
+│   ├── pi05微调完整指南.md         # ⭐ 真机主线：采集/转换/训练/推理服务/astribot_eval 闭环/踩坑
+│   └── pi05微调完整指南_仿真版.md  # 仿真链路存档（三轮失败的量化根因 + 框架语义坑）
 └── requirements_train.txt
 ```
 
@@ -66,24 +76,28 @@ python convert/hdf5_to_pi05.py --src demos --root datasets/pick_ball
 
 ### 路径二：真机数据微调（可部署策略）
 
-用官方链路遥操作采集真机数据，微调 pi0.5 得到能直接上真机的策略。数据采集、标注、转换、训练的完整步骤见 **[docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)**。真机数据原生带底盘/力矩/三相机，无 sim2real 鸿沟。
+用官方链路遥操作采集真机数据，微调 pi0.5 得到能直接上真机的策略。**完整步骤见 [docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)**（真机版，覆盖采集→转换→训练→推理服务→`astribot_eval` 闭环执行）。真机数据原生带底盘/力矩/三相机、`state[29:31]` 天然含真实 head 角度，无 sim2real 鸿沟。
 
 ## 核心文档
 
-**[docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)** 是本项目的核心 —— 从数据采集到部署评测的完整 pi0.5 微调指南，包含：
+**[docs/pi05微调完整指南.md](docs/pi05微调完整指南.md)** 是本项目的核心 —— **真机**微调与闭环部署的完整指南，包含：
 
-- 环境搭建（境内 tokenizer 离线化、ffmpeg）
-- 数据采集原则（随机化防因果混淆）与官方 HDF5 格式
-- 数据标注（单任务 `--coarse-prompt` / 多任务 JSON 标注 / 成功标签）
-- 转换、归一化、多卡训练、推理服务、闭环评测
-- **官方框架一批隐藏坑的解法**（add_frame 签名、sub_task_index、consolidate、离线 tokenizer、归一化路径、图像 CHW、state 34 维、sync 服务、因果混淆）
-- 34 维 SO3 动作空间布局附录
+- **真机 vs 仿真差异速查**（`async`/`rtc_delay:3` 与仿真的 `sync`/`rtc_delay:0` 是反的，最容易翻车）
+- 两套环境搭建（GPU 机训练推理 + 本体电脑执行系统）与安全规程
+- 真机遥操作采集、官方 HDF5 实测结构、**观测信息量自检**（开训前必做）
+- `--replace-state-with-action`：训练与推理的 state 语义对齐
+- 转换、归一化、多卡训练、推理服务、**`astribot_eval` 闭环 runbook**
+- 观测/动作协议精确规格 + RTC 如何用 `obs_timestamp`
+- **官方框架与执行系统的隐藏坑**（`prompt_way=None` 静默不动、共享缓冲尺寸写死、`model_kwargs` 覆盖语义、离线 tokenizer、图像 CHW…）
+- 34 维 SO3 布局 / 真机 HDF5 结构 / 仿真侧经验三个附录
+
+仿真链路的完整记录存档在 **[docs/pi05微调完整指南_仿真版.md](docs/pi05微调完整指南_仿真版.md)**。
 
 ## 技术要点
 
-- **动作空间**：官方 34 维全身笛卡尔 SO3 = `torso9 + left_arm9 + left_gripper1 + right_arm9 + right_gripper1 + head2 + chassis3`，底盘天然可学。
+- **动作空间**：**训练 31 维**（`torso9 + left_arm9 + left_gripper1 + right_arm9 + right_gripper1 + head2`），**推理输出 34 维**（末尾 chassis3 由框架从 state 原样复制，不是模型预测的）。也就是说**底盘不参与学习**，想让模型自己移底盘必须改框架——详见 `docs/pi05微调完整指南.md` §6.4。
 - **脚本专家**：11-DOF（躯干4+手臂7）阻尼最小二乘 IK + 官方 TCP 参考系 + 力矩自适应夹取 + 仿真时钟定步（抗共享服务器实时率波动）+ 底盘按物体位置站位。
-- **观测格式**：三相机 CHW float[0,1] + 34 维 state + prompt，msgpack/WebSocket 与官方 pi0.5 推理服务同构。
+- **观测格式（评测侧）**：三相机 CHW float[0,1] + 34 维 state + prompt，msgpack/WebSocket 与官方 pi0.5 推理服务同构。
 - **训练**：多卡 DeepSpeed ZeRO-2，小数据集冻结主干只训动作 expert 防过拟合。
 
 ## 环境
